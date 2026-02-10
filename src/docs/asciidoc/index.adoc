@@ -1,0 +1,930 @@
+= Identity Verification Service - Requirements & API Documentation
+:doctype: book
+:icons: font
+:source-highlighter: coderay
+:toc: left
+:toclevels: 4
+:sectlinks:
+:sectnums:
+:chapter-signifier: Chapter
+
+[[overview]]
+== Overview
+
+This document describes the Identity Verification module for the Certificate Management System.
+It covers the functional requirements, REST API specifications, sequence diagrams, and state diagrams
+for email and phone/SMS verification workflows.
+
+---
+
+[[chapter-3]]
+== 3: Identity Verification
+
+Identity verification is a critical step in the certificate issuance process. Before any certificate
+can be issued, the system must verify the identity of the requester through one or more verification
+channels. This chapter defines the requirements for email verification and phone/SMS verification.
+
+[[section-3-1]]
+=== 3.1 Email Verification
+
+==== User Story
+
+[quote]
+____
+*As a* security officer, +
+*I want to* verify user email addresses before issuing certificates, +
+*So that* certificates are only sent to legitimate email accounts.
+____
+
+==== Acceptance Criteria
+
+[cols="1,4,2", options="header"]
+|===
+|# |Criterion |Priority
+
+|AC-1
+|System must send verification email to user's registered corporate email address.
+|MUST
+
+|AC-2
+|Email must contain unique verification link valid for 24 hours.
+|MUST
+
+|AC-3
+|End Entity/User must click the link to verify email ownership.
+|MUST
+
+|AC-4
+|System must allow resending verification email up to 3 times.
+|MUST
+
+|AC-5
+|System must mark request as verified after successful email confirmation.
+|MUST
+
+|AC-6
+|Unverified requests must not proceed to approval.
+|MUST
+|===
+
+==== Email Verification - Sequence Diagram
+
+[mermaid]
+....
+sequenceDiagram
+    actor User as End Entity/User
+    participant Portal as Web Portal
+    participant VerifService as Verification Service
+    participant EmailService as Email Service
+    participant DB as Data Store
+
+    rect rgb(240, 248, 255)
+    Note over User, DB: Send Verification Email
+
+    User->>Portal: Submit certificate request
+    activate Portal
+    Portal->>VerifService: POST /api/v1/email-verification/send<br/>{requestId, corporateEmail}
+    activate VerifService
+
+    VerifService->>VerifService: Generate unique verification token
+    VerifService->>DB: Store verification record<br/>(token, email, status=EMAIL_SENT, expiry=24hrs)
+    activate DB
+    DB-->>VerifService: Stored
+    deactivate DB
+
+    VerifService->>EmailService: Send verification email with unique link
+    activate EmailService
+    EmailService-->>VerifService: Email sent
+    deactivate EmailService
+
+    VerifService-->>Portal: 201 Created<br/>{verificationId, status=EMAIL_SENT, expiresAt}
+    deactivate VerifService
+    Portal-->>User: Verification email sent notification
+    deactivate Portal
+    end
+
+    rect rgb(255, 255, 240)
+    Note over User, DB: Confirm Email (within 24 hours)
+
+    User->>User: Opens email, clicks verification link
+    User->>Portal: Click verification link
+    activate Portal
+    Portal->>VerifService: POST /api/v1/email-verification/confirm<br/>{token}
+    activate VerifService
+
+    VerifService->>DB: Lookup token
+    activate DB
+    DB-->>VerifService: Verification record
+    deactivate DB
+
+    VerifService->>VerifService: Validate token & check expiry (24hrs)
+
+    alt Token valid and not expired
+        VerifService->>DB: Update status=EMAIL_VERIFIED
+        DB-->>VerifService: Updated
+        VerifService-->>Portal: 200 OK {status=EMAIL_VERIFIED}
+        Portal-->>User: Email verified successfully
+    else Token expired
+        VerifService-->>Portal: 400 Bad Request {error: LINK_EXPIRED}
+        Portal-->>User: Link expired, please resend
+    else Token invalid
+        VerifService-->>Portal: 404 Not Found {error: INVALID_TOKEN}
+        Portal-->>User: Invalid verification link
+    end
+
+    deactivate VerifService
+    deactivate Portal
+    end
+
+    rect rgb(240, 255, 240)
+    Note over User, DB: Resend Verification Email (max 3 times)
+
+    User->>Portal: Request resend
+    activate Portal
+    Portal->>VerifService: POST /api/v1/email-verification/{id}/resend
+    activate VerifService
+
+    VerifService->>DB: Check resend count
+    activate DB
+    DB-->>VerifService: Current count
+    deactivate DB
+
+    alt Resend count < 3
+        VerifService->>VerifService: Generate new token, reset expiry to 24hrs
+        VerifService->>EmailService: Resend verification email
+        EmailService-->>VerifService: Email sent
+        VerifService->>DB: Increment resend count, store new token
+        DB-->>VerifService: Updated
+        VerifService-->>Portal: 200 OK {resendCount, maxResend=3}
+        Portal-->>User: New verification email sent
+    else Resend count >= 3
+        VerifService-->>Portal: 400 Bad Request {error: MAX_RESEND_EXCEEDED}
+        Portal-->>User: Maximum resend limit reached
+    end
+
+    deactivate VerifService
+    deactivate Portal
+    end
+....
+
+==== Email Verification - State Diagram
+
+[mermaid]
+....
+stateDiagram-v2
+    [*] --> PENDING : Certificate request submitted
+
+    PENDING --> EMAIL_SENT : Verification email sent to corporate email
+
+    EMAIL_SENT --> EMAIL_VERIFIED : User clicks valid verification link (within 24 hours)
+    EMAIL_SENT --> EMAIL_SENT : Resend email (count < 3)
+    EMAIL_SENT --> EXPIRED : Verification link expires after 24 hours
+    EMAIL_SENT --> FAILED : Max resend limit reached (3)
+
+    EXPIRED --> EMAIL_SENT : Resend email (if count < 3)
+    EXPIRED --> FAILED : Max resend limit reached (3)
+
+    EMAIL_VERIFIED --> [*] : Proceed to approval workflow
+
+    FAILED --> [*] : Request blocked (cannot proceed)
+
+    state EMAIL_VERIFIED {
+        [*] --> Verified : Email ownership confirmed
+        Verified --> MarkedForApproval : Request flagged as verified
+    }
+
+    note right of PENDING : Initial state when certificate request is submitted
+    note right of EMAIL_SENT : Verification link valid for 24 hours. Up to 3 resends allowed.
+    note left of FAILED : Unverified requests must NOT proceed to approval
+....
+
+---
+
+[[section-3-2]]
+=== 3.2 Phone/SMS Verification
+
+==== User Story
+
+[quote]
+____
+*As a* security officer, +
+*I want to* verify user phone numbers for sensitive certificates, +
+*So that* we have additional confidence in the requester's identity.
+____
+
+==== Acceptance Criteria
+
+[cols="1,4,2", options="header"]
+|===
+|# |Criterion |Priority
+
+|AC-1
+|System must send 6-digit verification code to user's registered mobile number.
+|MUST
+
+|AC-2
+|Code must be valid for 5 minutes.
+|MUST
+
+|AC-3
+|End Entity/User must enter code within time limit.
+|MUST
+
+|AC-4
+|System must allow maximum 3 attempts to enter correct code.
+|MUST
+
+|AC-5
+|System must allow resending code once per request.
+|MUST
+
+|AC-6
+|Failed verification must prevent request from proceeding.
+|MUST
+|===
+
+==== Phone/SMS Verification - Sequence Diagram
+
+[mermaid]
+....
+sequenceDiagram
+    actor User as End Entity/User
+    participant Portal as Web Portal
+    participant VerifService as Verification Service
+    participant SMSGateway as SMS Gateway
+    participant DB as Data Store
+
+    rect rgb(240, 248, 255)
+    Note over User, DB: Send Verification Code
+
+    User->>Portal: Request phone verification for sensitive certificate
+    activate Portal
+    Portal->>VerifService: POST /api/v1/phone-verification/send<br/>{requestId, mobileNumber}
+    activate VerifService
+
+    VerifService->>VerifService: Generate 6-digit verification code
+    VerifService->>DB: Store verification record<br/>(code, phone, status=SMS_SENT, expiry=5min, attempts=0)
+    activate DB
+    DB-->>VerifService: Stored
+    deactivate DB
+
+    VerifService->>SMSGateway: Send SMS with 6-digit code
+    activate SMSGateway
+    SMSGateway-->>VerifService: SMS delivered
+    deactivate SMSGateway
+
+    VerifService-->>Portal: 201 Created<br/>{verificationId, status=SMS_SENT, expiresAt, maxAttempts=3}
+    deactivate VerifService
+    Portal-->>User: Enter verification code (valid for 5 minutes)
+    deactivate Portal
+    end
+
+    rect rgb(255, 255, 240)
+    Note over User, DB: Verify Code (within 5 minutes, max 3 attempts)
+
+    User->>Portal: Enter 6-digit code
+    activate Portal
+    Portal->>VerifService: POST /api/v1/phone-verification/verify<br/>{verificationId, code}
+    activate VerifService
+
+    VerifService->>DB: Lookup verification
+    activate DB
+    DB-->>VerifService: Verification record
+    deactivate DB
+
+    VerifService->>VerifService: Check expiry (5 min) & attempt count (max 3)
+
+    alt Code correct and not expired and attempts < 3
+        VerifService->>DB: Update status=SMS_VERIFIED
+        DB-->>VerifService: Updated
+        VerifService-->>Portal: 200 OK {status=SMS_VERIFIED}
+        Portal-->>User: Phone verified successfully
+    else Code incorrect and attempts remaining
+        VerifService->>DB: Increment attempt count
+        DB-->>VerifService: Updated
+        VerifService-->>Portal: 400 Bad Request {error: INVALID_CODE, attemptsRemaining}
+        Portal-->>User: Incorrect code. X attempts remaining
+    else Code expired
+        VerifService-->>Portal: 400 Bad Request {error: CODE_EXPIRED}
+        Portal-->>User: Code expired. Request new code
+    else Max attempts exceeded
+        VerifService->>DB: Update status=FAILED
+        DB-->>VerifService: Updated
+        VerifService-->>Portal: 400 Bad Request {error: MAX_ATTEMPTS_EXCEEDED}
+        Portal-->>User: Verification failed. Max attempts reached
+    end
+
+    deactivate VerifService
+    deactivate Portal
+    end
+
+    rect rgb(240, 255, 240)
+    Note over User, DB: Resend Code (once per request)
+
+    User->>Portal: Request new code
+    activate Portal
+    Portal->>VerifService: POST /api/v1/phone-verification/{id}/resend
+    activate VerifService
+
+    VerifService->>DB: Check resend count
+    activate DB
+    DB-->>VerifService: Current count
+    deactivate DB
+
+    alt Resend count < 1
+        VerifService->>VerifService: Generate new 6-digit code, reset attempts, new 5-min expiry
+        VerifService->>SMSGateway: Send new SMS code
+        SMSGateway-->>VerifService: SMS delivered
+        VerifService->>DB: Update code, expiry, increment resend count
+        DB-->>VerifService: Updated
+        VerifService-->>Portal: 200 OK {resendCount=1, maxResend=1}
+        Portal-->>User: New code sent
+    else Resend count >= 1
+        VerifService-->>Portal: 400 Bad Request {error: MAX_RESEND_EXCEEDED}
+        Portal-->>User: Cannot resend. Only 1 resend allowed
+    end
+
+    deactivate VerifService
+    deactivate Portal
+    end
+....
+
+==== Phone/SMS Verification - State Diagram
+
+[mermaid]
+....
+stateDiagram-v2
+    [*] --> PENDING : Sensitive certificate requested
+
+    PENDING --> SMS_SENT : 6-digit code sent to mobile number
+
+    SMS_SENT --> SMS_VERIFIED : Correct code entered (within 5 min, attempts <= 3)
+    SMS_SENT --> SMS_SENT : Wrong code entered (attempts < 3)
+    SMS_SENT --> SMS_SENT : Resend code (resend count < 1)
+    SMS_SENT --> EXPIRED : Code expires after 5 minutes
+    SMS_SENT --> FAILED : Max attempts (3) exceeded
+
+    EXPIRED --> SMS_SENT : Resend code (if resend count < 1)
+    EXPIRED --> FAILED : No resends remaining
+
+    SMS_VERIFIED --> [*] : Proceed to approval workflow
+
+    FAILED --> [*] : Request blocked (cannot proceed)
+
+    note right of SMS_SENT : Code valid for 5 min. Max 3 attempts. 1 resend allowed.
+    note left of FAILED : Failed verification prevents request from proceeding
+....
+
+---
+
+[[rest-api]]
+== REST API Reference
+
+[[email-api]]
+=== Email Verification API
+
+[[email-send]]
+==== Send Verification Email
+
+Sends a verification email to the user's registered corporate email address.
+The email contains a unique verification link valid for 24 hours.
+
+===== Request
+
+`POST /api/v1/email-verification/send`
+
+====== Request Headers
+
+[cols="1,1,2", options="header"]
+|===
+|Header |Value |Description
+|Content-Type |application/json |Request body format
+|===
+
+====== Request Body
+
+[source,json]
+----
+{
+  "requestId": "REQ-2024-001",
+  "corporateEmail": "john.doe@company.com"
+}
+----
+
+[cols="1,1,1,3", options="header"]
+|===
+|Field |Type |Required |Description
+|requestId |String |Yes |Unique certificate request identifier
+|corporateEmail |String |Yes |User's registered corporate email address
+|===
+
+===== Response
+
+====== 201 Created
+
+[source,json]
+----
+{
+  "verificationId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "requestId": "REQ-2024-001",
+  "corporateEmail": "john.doe@company.com",
+  "status": "EMAIL_SENT",
+  "message": "Verification email sent to john.doe@company.com",
+  "resendCount": 0,
+  "maxResendAllowed": 3,
+  "expiresAt": "2024-01-16T10:30:00"
+}
+----
+
+====== 400 Bad Request - Validation Error
+
+[source,json]
+----
+{
+  "status": 400,
+  "error": "VALIDATION_ERROR",
+  "message": "corporateEmail: Must be a valid email address",
+  "timestamp": "2024-01-15T10:30:00"
+}
+----
+
+operation::email-send[snippets='http-request,request-fields,http-response,response-fields']
+
+---
+
+[[email-confirm]]
+==== Confirm Email Verification
+
+Confirms the user's email ownership by validating the verification token from the link.
+
+===== Request
+
+`POST /api/v1/email-verification/confirm`
+
+[source,json]
+----
+{
+  "token": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+}
+----
+
+===== Response
+
+====== 200 OK
+
+[source,json]
+----
+{
+  "verificationId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "requestId": "REQ-2024-001",
+  "corporateEmail": "john.doe@company.com",
+  "status": "EMAIL_VERIFIED",
+  "message": "Email verified successfully. Request marked as verified.",
+  "resendCount": 0,
+  "maxResendAllowed": 3,
+  "expiresAt": "2024-01-16T10:30:00"
+}
+----
+
+====== 400 Bad Request - Link Expired
+
+[source,json]
+----
+{
+  "status": 400,
+  "error": "LINK_EXPIRED",
+  "message": "Verification link has expired. Link is valid for 24 hours.",
+  "timestamp": "2024-01-15T10:30:00"
+}
+----
+
+operation::email-confirm[snippets='http-request,http-response']
+
+---
+
+[[email-resend]]
+==== Resend Verification Email
+
+Resends the verification email (maximum 3 times). Generates a new token and resets the 24-hour expiry.
+
+===== Request
+
+`POST /api/v1/email-verification/{verificationId}/resend`
+
+===== Response
+
+====== 200 OK
+
+[source,json]
+----
+{
+  "verificationId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "requestId": "REQ-2024-001",
+  "corporateEmail": "john.doe@company.com",
+  "status": "EMAIL_SENT",
+  "message": "Verification email resent. Resend count: 1/3",
+  "resendCount": 1,
+  "maxResendAllowed": 3,
+  "expiresAt": "2024-01-16T10:30:00"
+}
+----
+
+====== 400 Bad Request - Max Resend Exceeded
+
+[source,json]
+----
+{
+  "status": 400,
+  "error": "MAX_RESEND_EXCEEDED",
+  "message": "Maximum resend limit reached. Only 3 resends are allowed.",
+  "timestamp": "2024-01-15T10:30:00"
+}
+----
+
+operation::email-resend[snippets='http-request,http-response']
+
+---
+
+[[email-status]]
+==== Get Email Verification Status
+
+Returns the current verification status for the specified verification ID.
+
+===== Request
+
+`GET /api/v1/email-verification/{verificationId}/status`
+
+===== Response
+
+====== 200 OK
+
+[source,json]
+----
+{
+  "verificationId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "requestId": "REQ-2024-001",
+  "corporateEmail": "john.doe@company.com",
+  "status": "EMAIL_SENT",
+  "message": "Current verification status: EMAIL_SENT",
+  "resendCount": 0,
+  "maxResendAllowed": 3,
+  "expiresAt": "2024-01-16T10:30:00"
+}
+----
+
+operation::email-status[snippets='http-request,http-response']
+
+---
+
+[[phone-api]]
+=== Phone/SMS Verification API
+
+[[phone-send]]
+==== Send Verification Code
+
+Sends a 6-digit verification code via SMS to the user's registered mobile number.
+The code is valid for 5 minutes.
+
+===== Request
+
+`POST /api/v1/phone-verification/send`
+
+[source,json]
+----
+{
+  "requestId": "REQ-2024-001",
+  "mobileNumber": "+1234567890"
+}
+----
+
+[cols="1,1,1,3", options="header"]
+|===
+|Field |Type |Required |Description
+|requestId |String |Yes |Unique certificate request identifier
+|mobileNumber |String |Yes |User's registered mobile number (E.164 format)
+|===
+
+===== Response
+
+====== 201 Created
+
+[source,json]
+----
+{
+  "verificationId": "b2c3d4e5-f6a7-8901-bcde-f12345678901",
+  "requestId": "REQ-2024-001",
+  "mobileNumber": "****7890",
+  "status": "SMS_SENT",
+  "message": "6-digit verification code sent to ****7890. Code valid for 5 minutes.",
+  "attemptCount": 0,
+  "maxAttempts": 3,
+  "resendCount": 0,
+  "maxResendAllowed": 1,
+  "expiresAt": "2024-01-15T10:35:00"
+}
+----
+
+operation::phone-send[snippets='http-request,request-fields,http-response,response-fields']
+
+---
+
+[[phone-verify]]
+==== Verify SMS Code
+
+Verifies the 6-digit code entered by the user. Maximum 3 attempts allowed.
+
+===== Request
+
+`POST /api/v1/phone-verification/verify`
+
+[source,json]
+----
+{
+  "verificationId": "b2c3d4e5-f6a7-8901-bcde-f12345678901",
+  "code": "123456"
+}
+----
+
+===== Response
+
+====== 200 OK - Verified
+
+[source,json]
+----
+{
+  "verificationId": "b2c3d4e5-f6a7-8901-bcde-f12345678901",
+  "requestId": "REQ-2024-001",
+  "mobileNumber": "****7890",
+  "status": "SMS_VERIFIED",
+  "message": "Phone number verified successfully.",
+  "attemptCount": 1,
+  "maxAttempts": 3,
+  "resendCount": 0,
+  "maxResendAllowed": 1,
+  "expiresAt": "2024-01-15T10:35:00"
+}
+----
+
+====== 400 Bad Request - Invalid Code
+
+[source,json]
+----
+{
+  "status": 400,
+  "error": "INVALID_CODE",
+  "message": "Invalid verification code. 2 attempt(s) remaining.",
+  "timestamp": "2024-01-15T10:32:00"
+}
+----
+
+====== 400 Bad Request - Max Attempts Exceeded
+
+[source,json]
+----
+{
+  "status": 400,
+  "error": "MAX_ATTEMPTS_EXCEEDED",
+  "message": "Maximum verification attempts exceeded. Only 3 attempts allowed.",
+  "timestamp": "2024-01-15T10:33:00"
+}
+----
+
+====== 400 Bad Request - Code Expired
+
+[source,json]
+----
+{
+  "status": 400,
+  "error": "CODE_EXPIRED",
+  "message": "Verification code has expired. Code is valid for 5 minutes.",
+  "timestamp": "2024-01-15T10:40:00"
+}
+----
+
+operation::phone-verify[snippets='http-request,http-response']
+
+---
+
+[[phone-resend]]
+==== Resend Verification Code
+
+Resends a new 6-digit verification code. Only 1 resend is allowed per request.
+Resets the attempt counter and generates a new 5-minute expiry.
+
+===== Request
+
+`POST /api/v1/phone-verification/{verificationId}/resend`
+
+===== Response
+
+====== 200 OK
+
+[source,json]
+----
+{
+  "verificationId": "b2c3d4e5-f6a7-8901-bcde-f12345678901",
+  "requestId": "REQ-2024-001",
+  "mobileNumber": "****7890",
+  "status": "SMS_SENT",
+  "message": "New verification code sent. Resend count: 1/1",
+  "attemptCount": 0,
+  "maxAttempts": 3,
+  "resendCount": 1,
+  "maxResendAllowed": 1,
+  "expiresAt": "2024-01-15T10:40:00"
+}
+----
+
+====== 400 Bad Request - Max Resend Exceeded
+
+[source,json]
+----
+{
+  "status": 400,
+  "error": "MAX_RESEND_EXCEEDED",
+  "message": "Maximum resend limit reached. Only 1 resend allowed per request.",
+  "timestamp": "2024-01-15T10:35:00"
+}
+----
+
+operation::phone-resend[snippets='http-request,http-response']
+
+---
+
+[[phone-status]]
+==== Get Phone Verification Status
+
+Returns the current verification status for the phone verification.
+
+===== Request
+
+`GET /api/v1/phone-verification/{verificationId}/status`
+
+===== Response
+
+====== 200 OK
+
+[source,json]
+----
+{
+  "verificationId": "b2c3d4e5-f6a7-8901-bcde-f12345678901",
+  "requestId": "REQ-2024-001",
+  "mobileNumber": "****7890",
+  "status": "SMS_SENT",
+  "message": "Current verification status: SMS_SENT",
+  "attemptCount": 0,
+  "maxAttempts": 3,
+  "resendCount": 0,
+  "maxResendAllowed": 1,
+  "expiresAt": "2024-01-15T10:35:00"
+}
+----
+
+operation::phone-status[snippets='http-request,http-response']
+
+---
+
+[[combined-flow]]
+== Combined Identity Verification Flow
+
+The following diagram shows the complete identity verification flow when both email
+and phone verification are required for sensitive certificates.
+
+[mermaid]
+....
+sequenceDiagram
+    actor User as End Entity/User
+    participant Portal as Web Portal
+    participant VS as Verification Service
+    participant ES as Email Service
+    participant SMS as SMS Gateway
+    participant DB as Data Store
+
+    rect rgb(240, 248, 255)
+    Note over User, DB: Step 1 - Email Verification
+
+    User->>Portal: Submit certificate request
+    Portal->>VS: Initiate email verification
+    VS->>ES: Send verification email
+    ES-->>User: Email with verification link
+
+    User->>Portal: Click verification link
+    Portal->>VS: Confirm email token
+    VS->>DB: Mark email as verified
+    VS-->>Portal: Email verified
+    end
+
+    rect rgb(255, 255, 240)
+    Note over User, DB: Step 2 - Phone/SMS Verification (for sensitive certs)
+
+    Portal->>VS: Initiate phone verification
+    VS->>SMS: Send 6-digit code
+    SMS-->>User: SMS with code
+
+    User->>Portal: Enter 6-digit code
+    Portal->>VS: Verify SMS code
+    VS->>DB: Mark phone as verified
+    VS-->>Portal: Phone verified
+    end
+
+    rect rgb(240, 255, 240)
+    Note over User, DB: Step 3 - Proceed to Approval
+
+    Portal->>VS: Check all verifications
+    VS->>DB: Verify all checks passed
+    VS-->>Portal: All verifications complete
+    Portal-->>User: Request submitted for approval
+    end
+....
+
+[[combined-state]]
+=== Combined Verification State Machine
+
+[mermaid]
+....
+stateDiagram-v2
+    [*] --> RequestSubmitted
+
+    state "Identity Verification" as IV {
+
+        state "Email Verification" as EV {
+            [*] --> EmailPending
+            EmailPending --> EmailSent : Send email
+            EmailSent --> EmailVerified : Valid link clicked
+            EmailSent --> EmailSent : Resend (max 3)
+            EmailSent --> EmailFailed : Expired / Max resend
+            EmailVerified --> [*]
+            EmailFailed --> [*]
+        }
+
+        state "Phone Verification" as PV {
+            [*] --> PhonePending
+            PhonePending --> CodeSent : Send SMS code
+            CodeSent --> PhoneVerified : Correct code
+            CodeSent --> CodeSent : Wrong code or Resend
+            CodeSent --> PhoneFailed : Max attempts / Expired
+            PhoneVerified --> [*]
+            PhoneFailed --> [*]
+        }
+    }
+
+    RequestSubmitted --> IV : Start verification
+
+    IV --> AllVerified : Both email and phone verified
+    IV --> VerificationFailed : Any verification failed
+
+    AllVerified --> PendingApproval : Submit for approval review
+    VerificationFailed --> RequestBlocked : Cannot proceed
+
+    PendingApproval --> [*]
+    RequestBlocked --> [*]
+....
+
+---
+
+[[appendix]]
+== Appendix
+
+=== Verification Status Codes
+
+[cols="1,3", options="header"]
+|===
+|Status |Description
+|PENDING |Verification request created but not yet initiated
+|EMAIL_SENT |Verification email sent, awaiting user confirmation
+|EMAIL_VERIFIED |Email ownership confirmed via verification link
+|SMS_SENT |SMS verification code sent, awaiting user input
+|SMS_VERIFIED |Phone number confirmed via correct code entry
+|VERIFIED |All required verifications completed successfully
+|FAILED |Verification failed (max attempts, max resends, or other error)
+|EXPIRED |Verification link or code has expired
+|===
+
+=== Error Codes
+
+[cols="1,1,3", options="header"]
+|===
+|Error Code |HTTP Status |Description
+|VALIDATION_ERROR |400 |Request body validation failed
+|LINK_EXPIRED |400 |Email verification link has expired (24-hour limit)
+|CODE_EXPIRED |400 |SMS verification code has expired (5-minute limit)
+|INVALID_CODE |400 |Incorrect SMS verification code entered
+|MAX_RESEND_EXCEEDED |400 |Maximum resend attempts exceeded
+|MAX_ATTEMPTS_EXCEEDED |400 |Maximum code entry attempts exceeded
+|VERIFICATION_NOT_FOUND |404 |Specified verification ID does not exist
+|VERIFICATION_FAILED |400 |Verification permanently failed
+|===
+
+=== Business Rules Summary
+
+.Email Verification Rules
+* Verification link validity: *24 hours*
+* Maximum email resends: *3 times*
+* Unverified emails block certificate approval
+
+.Phone/SMS Verification Rules
+* Verification code: *6 digits*
+* Code validity: *5 minutes*
+* Maximum code entry attempts: *3*
+* Maximum code resends: *1 per request*
+* Failed phone verification blocks certificate request

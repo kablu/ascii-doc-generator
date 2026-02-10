@@ -1,0 +1,15 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: identity-verification-service
+
+verification:
+  email:
+    link-validity-hours: 24
+    max-resend-count: 3
+  phone:
+    code-validity-minutes: 5
+    max-attempts: 3
+    max-resend-count: 1
