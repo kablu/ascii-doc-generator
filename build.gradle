@@ -100,6 +100,50 @@ tasks.named('asciidoctorPdf') {
     dependsOn test
 }
 
+// End Entity Login & MFA - standalone AsciiDoc PDF (no test snippets needed)
+tasks.register('endEntityHtml', org.asciidoctor.gradle.jvm.AsciidoctorTask) {
+    sourceDir = file('docs/end-entity')
+    sources {
+        include 'index.adoc'
+    }
+    outputDir = file("build/docs/end-entity/html")
+    configurations 'asciidoctorExt'
+
+    baseDirFollowsSourceDir()
+
+    attributes(
+        'project-version': project.version,
+        'source-highlighter': 'coderay',
+        'toc': 'left',
+        'toclevels': '4',
+        'icons': 'font',
+        'idprefix': '',
+        'idseparator': '-'
+    )
+}
+
+tasks.register('endEntityPdf', org.asciidoctor.gradle.jvm.pdf.AsciidoctorPdfTask) {
+    sourceDir = file('docs/end-entity')
+    sources {
+        include 'index.adoc'
+    }
+    outputDir = file("build/docs/end-entity/pdf")
+    configurations 'asciidoctorExt'
+
+    baseDirFollowsSourceDir()
+
+    attributes(
+        'project-version': project.version,
+        'source-highlighter': 'coderay',
+        'toc': 'left',
+        'toclevels': '4',
+        'icons': 'font',
+        'idprefix': '',
+        'idseparator': '-',
+        'pdf-theme': 'default-with-fallback-font'
+    )
+}
+
 bootJar {
     dependsOn asciidoctor, asciidoctorPdf
     from("${asciidoctor.outputDir}") {

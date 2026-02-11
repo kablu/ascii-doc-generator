@@ -1,0 +1,1247 @@
+= End Entity/User Login & Multi-Factor Authentication - Requirements & API Documentation
+:doctype: book
+:icons: font
+:source-highlighter: coderay
+:toc: left
+:toclevels: 4
+:sectlinks:
+:sectnums:
+:chapter-signifier: Chapter
+
+[[overview]]
+== Overview
+
+This document describes the End Entity/User Login and Multi-Factor Authentication (MFA) module
+for the Certificate Management System. It covers the functional requirements, REST API specifications,
+sequence diagrams, block diagrams, request/response structures, and client-side/server-side validation rules
+for user authentication and MFA workflows.
+
+---
+
+[[chapter-1]]
+== 1: End Entity/User Authentication
+
+End Entity/User authentication is the gateway to the Certificate Management System. Users must
+authenticate using their corporate Active Directory (AD) credentials before accessing any system
+functionality. Upon successful authentication, the system enforces Multi-Factor Authentication (MFA)
+to ensure a higher level of security before granting access to role-appropriate dashboards.
+
+[[section-1-1]]
+=== 1.1 End Entity/User Login
+
+==== User Story
+
+[quote]
+____
+*As an* End Entity/User, +
+*I want to* authenticate using my Active Directory username and password, +
+*So that* I can securely access the Certificate Management System with my corporate credentials.
+____
+
+==== Acceptance Criteria
+
+[cols="1,5,2", options="header"]
+|===
+|# |Criterion |Priority
+
+|AC-1
+|End Entity/User must authenticate using existing Active Directory username and password.
+|MUST
+
+|AC-2
+|System must validate credentials against Active Directory in real-time.
+|MUST
+
+|AC-3
+|End Entity/User must see clear error messages if authentication fails (invalid username, wrong password, account locked, account disabled).
+|MUST
+
+|AC-4
+|End Entity/User must be automatically redirected to their role-appropriate dashboard after successful login.
+|MUST
+
+|AC-5
+|System must lock account after 5 consecutive failed login attempts for 30 minutes.
+|MUST
+
+|AC-6
+|System must log all authentication attempts (success and failure) with timestamp, IP address, and username.
+|MUST
+
+|AC-7
+|Session must expire after 30 minutes of inactivity.
+|SHOULD
+
+|AC-8
+|System must support concurrent sessions per user with a maximum limit of 3.
+|SHOULD
+|===
+
+==== Client-Side Validation Rules
+
+[cols="2,4,2", options="header"]
+|===
+|Field |Validation Rule |Error Message
+
+|Username
+|Required, minimum 3 characters, maximum 50 characters, alphanumeric with dots and underscores only.
+|"Username is required and must be 3-50 alphanumeric characters."
+
+|Password
+|Required, minimum 8 characters, maximum 128 characters.
+|"Password is required and must be at least 8 characters."
+
+|Username
+|Must not contain leading/trailing whitespace.
+|"Username must not contain leading or trailing spaces."
+
+|Password
+|Must not be empty or contain only whitespace.
+|"Password cannot be blank."
+|===
+
+==== Server-Side Validation Rules
+
+[cols="2,4,3", options="header"]
+|===
+|Validation |Rule |Response
+
+|Active Directory Lookup
+|Username must exist in Active Directory.
+|401 Unauthorized - "Invalid username or password."
+
+|Password Verification
+|Password must match AD-stored hash via LDAP bind.
+|401 Unauthorized - "Invalid username or password."
+
+|Account Status
+|AD account must not be disabled or locked.
+|403 Forbidden - "Account is locked or disabled. Contact administrator."
+
+|Account Lockout
+|Reject login if 5+ consecutive failures within 30 minutes.
+|423 Locked - "Account temporarily locked due to multiple failed attempts. Try again after 30 minutes."
+
+|Rate Limiting
+|Maximum 10 login requests per minute per IP address.
+|429 Too Many Requests - "Rate limit exceeded. Please try again later."
+
+|Input Sanitization
+|Username must be sanitized against LDAP injection.
+|400 Bad Request - "Invalid characters in username."
+
+|Session Limit
+|Maximum 3 concurrent active sessions per user.
+|409 Conflict - "Maximum concurrent sessions reached. Please logout from another session."
+|===
+
+==== End Entity/User Login - Sequence Diagram
+
+[mermaid]
+....
+sequenceDiagram
+    actor User as End Entity/User
+    participant Browser as Web Browser
+    participant Gateway as API Gateway
+    participant AuthSvc as Auth Service
+    participant AD as Active Directory
+    participant Sessions as Session Store
+    participant Audit as Audit Log
+
+    rect rgb(240, 248, 255)
+    Note over User, Audit: Send Login Request
+
+    User->>Browser: Enter username and password
+    Browser->>Browser: Client-side validation
+
+    alt Client validation fails
+        Browser-->>User: Display validation errors
+    else Client validation passes
+        Browser->>Gateway: POST /api/v1/auth/login
+        activate Gateway
+        Gateway->>Gateway: Rate limit check
+        Gateway->>AuthSvc: Forward login request
+        activate AuthSvc
+        AuthSvc->>AuthSvc: Sanitize input
+        AuthSvc->>AuthSvc: Check lockout status
+        AuthSvc->>AD: LDAP Bind
+        activate AD
+    end
+    end
+
+    rect rgb(240, 255, 240)
+    Note over User, Audit: Credential Validation
+
+    alt Credentials valid
+        AD-->>AuthSvc: Bind success with user roles
+        deactivate AD
+        AuthSvc->>Sessions: Check active session count
+        activate Sessions
+        Sessions-->>AuthSvc: Session count OK
+        deactivate Sessions
+        AuthSvc->>Sessions: Create session with JWT
+        AuthSvc->>AuthSvc: Determine dashboard by role
+        AuthSvc->>Audit: Log successful login
+        AuthSvc-->>Gateway: 200 OK with tokens and dashboard URL
+        deactivate AuthSvc
+        Gateway-->>Browser: Login success
+        deactivate Gateway
+        Browser->>Browser: Store tokens in httpOnly cookie
+        Browser-->>User: Redirect to role-appropriate dashboard
+    else Credentials invalid
+        AD-->>AuthSvc: Bind failed
+        AuthSvc->>AuthSvc: Increment failed counter
+        AuthSvc->>Audit: Log failed attempt
+
+        alt 5th consecutive failure
+            AuthSvc->>AuthSvc: Lock account 30 minutes
+            AuthSvc->>Audit: Log account lockout
+            AuthSvc-->>Gateway: 423 Account Locked
+            Gateway-->>Browser: Account locked response
+            Browser-->>User: Account locked message
+        else Under 5 failures
+            AuthSvc-->>Gateway: 401 Unauthorized
+            Gateway-->>Browser: Invalid credentials
+            Browser-->>User: Invalid username or password
+        end
+    end
+    end
+
+    rect rgb(255, 240, 240)
+    Note over User, Audit: Error Scenarios
+
+    alt Rate limit exceeded
+        Gateway-->>Browser: 429 Too Many Requests
+        Browser-->>User: Rate limit exceeded message
+    else Account locked
+        AuthSvc-->>Gateway: 423 Locked
+        Gateway-->>Browser: Account locked until time
+        Browser-->>User: Account temporarily locked
+    else Max sessions reached
+        Sessions-->>AuthSvc: Limit exceeded
+        AuthSvc-->>Gateway: 409 Conflict
+        Gateway-->>Browser: Session limit reached
+        Browser-->>User: Maximum concurrent sessions
+    end
+    end
+....
+
+==== End Entity/User Login - State Diagram
+
+[mermaid]
+....
+stateDiagram-v2
+    [*] --> Unauthenticated
+
+    state Unauthenticated {
+        [*] --> LoginPage
+        LoginPage --> Validating : Submit credentials
+    }
+
+    state Validating {
+        [*] --> ClientValidation
+        ClientValidation --> ServerValidation : Client checks pass
+        ClientValidation --> LoginPage : Client checks fail
+        ServerValidation --> RateLimitCheck
+        RateLimitCheck --> LockoutCheck : Under rate limit
+        RateLimitCheck --> RateLimited : Exceeded rate limit
+        LockoutCheck --> ADAuthentication : Account not locked
+        LockoutCheck --> AccountLocked : Account locked
+        ADAuthentication --> SessionCheck : AD bind success
+        ADAuthentication --> FailedAttempt : AD bind failed
+    }
+
+    state FailedAttempt {
+        [*] --> IncrementCounter
+        IncrementCounter --> LoginPage : Under 5 failures
+        IncrementCounter --> AccountLocked : 5th failure reached
+    }
+
+    state AccountLocked {
+        [*] --> WaitLockout
+        WaitLockout --> LoginPage : 30 min elapsed
+    }
+
+    RateLimited --> LoginPage : Wait and retry
+
+    state SessionCheck {
+        [*] --> CheckConcurrency
+        CheckConcurrency --> CreateSession : Under 3 sessions
+        CheckConcurrency --> SessionLimitReached : 3 sessions active
+    }
+
+    SessionLimitReached --> LoginPage : Logout from another session
+
+    state Authenticated {
+        [*] --> DashboardRedirect
+        DashboardRedirect --> ActiveSession
+        ActiveSession --> SessionExpired : 30 min inactivity
+        ActiveSession --> MFARequired : MFA not completed
+    }
+
+    CreateSession --> Authenticated
+    SessionExpired --> Unauthenticated
+    MFARequired --> MFAFlow
+
+    state MFAFlow {
+        [*] --> AwaitMFA
+    }
+....
+
+==== End Entity/User Login - Block Diagram
+
+[mermaid]
+....
+flowchart TB
+    subgraph CLIENT["Client Layer"]
+        direction TB
+        UI["Login UI<br/>(Username + Password Form)"]
+        CV["Client-Side Validator<br/>(Required fields, format, length)"]
+        TM["Token Manager<br/>(Store/refresh JWT)"]
+    end
+
+    subgraph GATEWAY["API Gateway Layer"]
+        direction TB
+        RL["Rate Limiter<br/>(10 req/min/IP)"]
+        RF["Request Filter<br/>(Input sanitization)"]
+        LB["Load Balancer"]
+    end
+
+    subgraph AUTH["Authentication Service"]
+        direction TB
+        AC["Auth Controller<br/>POST /api/v1/auth/login"]
+        AS["Auth Service<br/>(Credential validation)"]
+        LM["Lockout Manager<br/>(5 attempts / 30 min lock)"]
+        SM["Session Manager<br/>(Max 3 concurrent)"]
+        JG["JWT Generator<br/>(Access + Refresh tokens)"]
+        RR["Role Resolver<br/>(Dashboard routing)"]
+    end
+
+    subgraph EXTERNAL["External Systems"]
+        direction TB
+        AD["Active Directory<br/>(LDAP Server)"]
+        SS["Session Store<br/>(Redis)"]
+        AL["Audit Log<br/>(Elasticsearch)"]
+    end
+
+    UI --> CV
+    CV --> RL
+    RL --> RF
+    RF --> LB
+    LB --> AC
+    AC --> AS
+    AS --> LM
+    LM --> AD
+    AS --> SM
+    SM --> SS
+    AS --> JG
+    AS --> RR
+    JG --> TM
+    AS --> AL
+    AC --> TM
+
+    style CLIENT fill:#E3F2FD,stroke:#1565C0
+    style GATEWAY fill:#FFF3E0,stroke:#E65100
+    style AUTH fill:#E8F5E9,stroke:#2E7D32
+    style EXTERNAL fill:#FCE4EC,stroke:#C62828
+....
+
+---
+
+[[section-1-2]]
+=== 1.2 Multi-Factor Authentication (MFA)
+
+==== User Story
+
+[quote]
+____
+*As an* End Entity/User, +
+*I want to* verify my identity using a second factor (OTP via email or authenticator app) after login, +
+*So that* my account is protected even if my password is compromised.
+____
+
+==== Acceptance Criteria
+
+[cols="1,5,2", options="header"]
+|===
+|# |Criterion |Priority
+
+|AC-1
+|System must prompt for MFA immediately after successful AD authentication.
+|MUST
+
+|AC-2
+|System must support Time-based One-Time Password (TOTP) via authenticator app (e.g., Google Authenticator, Microsoft Authenticator).
+|MUST
+
+|AC-3
+|System must support OTP delivery via registered corporate email as a fallback MFA method.
+|MUST
+
+|AC-4
+|TOTP/OTP code must be 6 digits and valid for 30 seconds (TOTP) or 5 minutes (email OTP).
+|MUST
+
+|AC-5
+|System must allow maximum 3 attempts to enter correct MFA code per session.
+|MUST
+
+|AC-6
+|Failed MFA verification (3 attempts exhausted) must terminate the login session and redirect to login page.
+|MUST
+
+|AC-7
+|System must allow user to request resending email OTP once per MFA session.
+|SHOULD
+
+|AC-8
+|System must allow user to switch between TOTP and email OTP methods during MFA prompt.
+|SHOULD
+
+|AC-9
+|System must enforce MFA setup on first login if MFA is not yet configured for the user.
+|MUST
+
+|AC-10
+|System must generate and display recovery codes (8 codes) during MFA setup for account recovery.
+|MUST
+|===
+
+==== Client-Side Validation Rules
+
+[cols="2,4,2", options="header"]
+|===
+|Field |Validation Rule |Error Message
+
+|MFA Code
+|Required, exactly 6 digits, numeric only.
+|"MFA code must be exactly 6 digits."
+
+|MFA Code
+|Must not contain spaces or special characters.
+|"MFA code must contain only numbers."
+
+|MFA Method Selection
+|Required, must be either "totp" or "email".
+|"Please select an MFA method."
+
+|Recovery Code
+|Required when using recovery, 8 alphanumeric characters.
+|"Recovery code must be 8 alphanumeric characters."
+|===
+
+==== Server-Side Validation Rules
+
+[cols="2,4,3", options="header"]
+|===
+|Validation |Rule |Response
+
+|Session Validity
+|MFA request must be associated with a valid pre-authenticated session.
+|401 Unauthorized - "Session expired. Please login again."
+
+|TOTP Verification
+|Code must match current or previous 30-second TOTP window (clock drift tolerance of +/- 1 window).
+|401 Unauthorized - "Invalid MFA code."
+
+|Email OTP Verification
+|Code must match stored OTP and must not be expired (5-minute TTL).
+|401 Unauthorized - "Invalid or expired MFA code."
+
+|Attempt Limit
+|Maximum 3 verification attempts per MFA session.
+|423 Locked - "Maximum MFA attempts exceeded. Please login again."
+
+|Resend Limit
+|Maximum 1 email OTP resend per MFA session.
+|429 Too Many Requests - "Resend limit reached for this session."
+
+|Recovery Code
+|Must match one of the user's unused recovery codes.
+|401 Unauthorized - "Invalid recovery code."
+
+|Recovery Code Single Use
+|Recovery code must be invalidated after successful use.
+|N/A (internal operation)
+
+|MFA Setup Required
+|First login users without MFA must complete MFA enrollment before proceeding.
+|403 Forbidden - "MFA setup required before accessing the system."
+
+|TOTP Secret
+|TOTP secret must be generated using HMAC-SHA1 with 160-bit key per RFC 6238.
+|N/A (internal operation)
+|===
+
+==== Multi-Factor Authentication - Sequence Diagram
+
+[mermaid]
+....
+sequenceDiagram
+    actor User as End Entity/User
+    participant Browser as Web Browser
+    participant Gateway as API Gateway
+    participant MFASvc as MFA Service
+    participant TOTP as TOTP Engine
+    participant Email as Email Service
+    participant DB as Data Store
+    participant Audit as Audit Log
+
+    rect rgb(255, 248, 240)
+    Note over User, Audit: MFA Status Check
+
+    Browser->>Gateway: GET /api/v1/mfa/status
+    activate Gateway
+    Gateway->>MFASvc: Check MFA status
+    activate MFASvc
+
+    alt MFA not configured
+        MFASvc-->>Gateway: 403 MFA setup required
+        Gateway-->>Browser: Redirect to MFA setup
+        Browser-->>User: Display MFA setup page
+    else MFA configured
+        MFASvc-->>Gateway: 200 OK with available methods
+        deactivate MFASvc
+        Gateway-->>Browser: MFA challenge required
+        deactivate Gateway
+        Browser-->>User: Display MFA code prompt
+    end
+    end
+
+    rect rgb(240, 255, 248)
+    Note over User, Audit: MFA First-Time Setup Flow
+
+    User->>Browser: Select TOTP method
+    Browser->>Gateway: POST /api/v1/mfa/setup
+    activate Gateway
+    Gateway->>MFASvc: Generate TOTP secret
+    activate MFASvc
+    MFASvc->>TOTP: Generate secret and QR code
+    activate TOTP
+    TOTP-->>MFASvc: Secret and QR code URI
+    deactivate TOTP
+    MFASvc->>DB: Store TOTP secret encrypted
+    MFASvc->>MFASvc: Generate 8 recovery codes
+    MFASvc->>DB: Store recovery codes hashed
+    MFASvc-->>Gateway: 200 OK with QR and recovery codes
+    deactivate MFASvc
+    Gateway-->>Browser: Setup response
+    deactivate Gateway
+    Browser-->>User: Display QR code and recovery codes
+
+    User->>Browser: Scan QR and enter verification code
+    Browser->>Gateway: POST /api/v1/mfa/setup/verify
+    activate Gateway
+    Gateway->>MFASvc: Verify setup code
+    activate MFASvc
+    MFASvc->>TOTP: Validate TOTP code
+    TOTP-->>MFASvc: Valid
+    MFASvc->>DB: Mark MFA as configured
+    MFASvc->>Audit: Log MFA setup complete
+    MFASvc-->>Gateway: 200 OK MFA enabled
+    deactivate MFASvc
+    Gateway-->>Browser: Setup complete
+    deactivate Gateway
+    Browser-->>User: Redirect to dashboard
+    end
+
+    rect rgb(248, 248, 255)
+    Note over User, Audit: TOTP Verification Flow
+
+    User->>Browser: Enter 6-digit TOTP code
+    Browser->>Browser: Client validation 6 digits numeric
+    Browser->>Gateway: POST /api/v1/mfa/verify method totp
+    activate Gateway
+    Gateway->>MFASvc: Verify MFA code
+    activate MFASvc
+    MFASvc->>MFASvc: Check attempt count max 3
+    MFASvc->>TOTP: Validate TOTP with clock drift
+    activate TOTP
+
+    alt Code valid
+        TOTP-->>MFASvc: Valid
+        deactivate TOTP
+        MFASvc->>DB: Update session MFA verified
+        MFASvc->>Audit: Log MFA success
+        MFASvc-->>Gateway: 200 OK with access token
+        Gateway-->>Browser: MFA verified
+        Browser-->>User: Redirect to dashboard
+    else Code invalid
+        TOTP-->>MFASvc: Invalid
+        MFASvc->>MFASvc: Increment attempt counter
+        MFASvc->>Audit: Log MFA failure
+        MFASvc-->>Gateway: 401 Unauthorized with attempts remaining
+        deactivate MFASvc
+        Gateway-->>Browser: Invalid code
+        deactivate Gateway
+        Browser-->>User: Invalid code with attempts remaining
+    end
+    end
+
+    rect rgb(255, 248, 248)
+    Note over User, Audit: Email OTP Flow
+
+    User->>Browser: Select email OTP method
+    Browser->>Gateway: POST /api/v1/mfa/email/send
+    activate Gateway
+    Gateway->>MFASvc: Send email OTP
+    activate MFASvc
+    MFASvc->>MFASvc: Generate 6-digit OTP 5 min TTL
+    MFASvc->>DB: Store OTP hashed with expiry
+    MFASvc->>Email: Send OTP to registered email
+    activate Email
+    Email-->>MFASvc: Sent
+    deactivate Email
+    MFASvc-->>Gateway: 200 OK OTP sent
+    deactivate MFASvc
+    Gateway-->>Browser: OTP sent confirmation
+    deactivate Gateway
+    Browser-->>User: OTP sent to registered email
+
+    User->>Browser: Enter 6-digit email OTP
+    Browser->>Gateway: POST /api/v1/mfa/verify method email
+    activate Gateway
+    Gateway->>MFASvc: Verify email OTP
+    activate MFASvc
+
+    alt Valid and not expired
+        MFASvc->>DB: Update session MFA verified
+        MFASvc->>Audit: Log MFA success email
+        MFASvc-->>Gateway: 200 OK with access token
+        Gateway-->>Browser: MFA verified
+        Browser-->>User: Redirect to dashboard
+    else Invalid or expired
+        MFASvc->>Audit: Log MFA failure
+        MFASvc-->>Gateway: 401 Unauthorized
+        deactivate MFASvc
+        Gateway-->>Browser: Invalid or expired code
+        deactivate Gateway
+        Browser-->>User: Invalid or expired code
+    end
+    end
+
+    rect rgb(248, 255, 248)
+    Note over User, Audit: Recovery Code Flow
+
+    User->>Browser: Enter recovery code
+    Browser->>Gateway: POST /api/v1/mfa/recovery
+    activate Gateway
+    Gateway->>MFASvc: Verify recovery code
+    activate MFASvc
+    MFASvc->>DB: Check recovery code hashed match
+
+    alt Valid recovery code
+        MFASvc->>DB: Invalidate used recovery code
+        MFASvc->>DB: Update session MFA verified
+        MFASvc->>Audit: Log MFA success recovery
+        MFASvc-->>Gateway: 200 OK with remaining codes count
+        Gateway-->>Browser: MFA verified via recovery
+        Browser-->>User: Logged in with remaining codes warning
+    else Invalid recovery code
+        MFASvc->>Audit: Log recovery failure
+        MFASvc-->>Gateway: 401 Unauthorized
+        deactivate MFASvc
+        Gateway-->>Browser: Invalid recovery code
+        deactivate Gateway
+        Browser-->>User: Invalid recovery code
+    end
+    end
+....
+
+==== Multi-Factor Authentication - State Diagram
+
+[mermaid]
+....
+stateDiagram-v2
+    [*] --> LoginCompleted
+
+    state LoginCompleted {
+        [*] --> CheckMFAStatus
+        CheckMFAStatus --> MFASetupRequired : MFA not configured
+        CheckMFAStatus --> MFAChallengeIssued : MFA configured
+    }
+
+    state MFASetupRequired {
+        [*] --> SelectMethod
+        SelectMethod --> GenerateTOTPSecret : Choose TOTP
+        GenerateTOTPSecret --> DisplayQRCode
+        DisplayQRCode --> VerifySetupCode
+        VerifySetupCode --> GenerateRecoveryCodes : Code valid
+        VerifySetupCode --> DisplayQRCode : Code invalid
+        GenerateRecoveryCodes --> MFAConfigured
+    }
+
+    MFAConfigured --> MFAChallengeIssued
+
+    state MFAChallengeIssued {
+        [*] --> AwaitCode
+        AwaitCode --> TOTPVerification : TOTP selected
+        AwaitCode --> EmailOTPFlow : Email OTP selected
+        AwaitCode --> RecoveryCodeFlow : Recovery code selected
+    }
+
+    state TOTPVerification {
+        [*] --> ValidateTOTP
+        ValidateTOTP --> MFAVerified : Code valid
+        ValidateTOTP --> CheckAttempts : Code invalid
+        CheckAttempts --> AwaitCode : Attempts remaining
+        CheckAttempts --> MFAFailed : 3 attempts exhausted
+    }
+
+    state EmailOTPFlow {
+        [*] --> SendEmailOTP
+        SendEmailOTP --> AwaitEmailCode
+        AwaitEmailCode --> ValidateEmailOTP : Code entered
+        ValidateEmailOTP --> MFAVerified : Code valid and not expired
+        ValidateEmailOTP --> CheckEmailAttempts : Invalid or expired
+        CheckEmailAttempts --> AwaitEmailCode : Attempts remaining
+        CheckEmailAttempts --> MFAFailed : 3 attempts exhausted
+        AwaitEmailCode --> ResendEmailOTP : Request resend
+        ResendEmailOTP --> AwaitEmailCode : Resend count < 1
+        ResendEmailOTP --> ResendLimitReached : Resend count >= 1
+        ResendLimitReached --> AwaitEmailCode
+    }
+
+    state RecoveryCodeFlow {
+        [*] --> EnterRecoveryCode
+        EnterRecoveryCode --> ValidateRecoveryCode
+        ValidateRecoveryCode --> InvalidateUsedCode : Code valid
+        InvalidateUsedCode --> MFAVerified
+        ValidateRecoveryCode --> MFAFailed : Code invalid
+    }
+
+    state MFAVerified {
+        [*] --> IssueFullAccessToken
+        IssueFullAccessToken --> RedirectToDashboard
+    }
+
+    state MFAFailed {
+        [*] --> TerminateSession
+        TerminateSession --> [*]
+    }
+
+    MFAFailed --> LoginPage : Redirect to login
+    MFAVerified --> Authenticated
+
+    state Authenticated {
+        [*] --> Dashboard
+    }
+
+    state LoginPage {
+        [*] --> Unauthenticated
+    }
+....
+
+==== Multi-Factor Authentication - Block Diagram
+
+[mermaid]
+....
+flowchart TB
+    subgraph CLIENT["Client Layer"]
+        direction TB
+        MUI["MFA Prompt UI<br/>(Code input + method switch)"]
+        SETUP["MFA Setup UI<br/>(QR code + recovery codes)"]
+        MCV["Client Validator<br/>(6 digits, numeric only)"]
+    end
+
+    subgraph GATEWAY["API Gateway Layer"]
+        direction TB
+        SF["Session Filter<br/>(Validate pre-auth session)"]
+        RL2["Rate Limiter<br/>(MFA endpoints)"]
+    end
+
+    subgraph MFA["MFA Service"]
+        direction TB
+        MC["MFA Controller<br/>(verify, setup, recovery)"]
+        MS["MFA Service<br/>(Orchestration)"]
+        TE["TOTP Engine<br/>(RFC 6238 HMAC-SHA1)"]
+        OG["OTP Generator<br/>(6-digit, 5-min TTL)"]
+        RC["Recovery Code Manager<br/>(Generate, validate, invalidate)"]
+        AM["Attempt Manager<br/>(Max 3 per session)"]
+    end
+
+    subgraph EXTERNAL2["External Systems"]
+        direction TB
+        ES["Email Service<br/>(OTP delivery)"]
+        DB2["Data Store<br/>(Encrypted secrets, hashed OTPs)"]
+        AL2["Audit Log"]
+        SS2["Session Store<br/>(Redis)"]
+    end
+
+    MUI --> MCV
+    SETUP --> MCV
+    MCV --> SF
+    SF --> RL2
+    RL2 --> MC
+    MC --> MS
+    MS --> TE
+    MS --> OG
+    MS --> RC
+    MS --> AM
+    OG --> ES
+    MS --> DB2
+    MS --> AL2
+    MS --> SS2
+    TE --> DB2
+
+    style CLIENT fill:#E3F2FD,stroke:#1565C0
+    style GATEWAY fill:#FFF3E0,stroke:#E65100
+    style MFA fill:#F3E5F5,stroke:#6A1B9A
+    style EXTERNAL2 fill:#FCE4EC,stroke:#C62828
+....
+
+---
+
+[[chapter-2]]
+== 2: REST API Reference
+
+[[section-2-1]]
+=== 2.1 Authentication APIs
+
+[[api-login]]
+==== POST /api/v1/auth/login
+
+Authenticate End Entity/User using Active Directory credentials.
+
+===== Request
+
+[source,http]
+----
+POST /api/v1/auth/login HTTP/1.1
+Content-Type: application/json
+Host: certificate-mgmt.example.com
+
+{
+    "username": "john.doe",
+    "password": "SecureP@ssw0rd"
+}
+----
+
+.Request Fields
+[cols="2,2,4", options="header"]
+|===
+|Field |Type |Description
+|`username` |String |Active Directory username (3-50 chars, alphanumeric with dots/underscores)
+|`password` |String |Active Directory password (8-128 chars)
+|===
+
+===== Response - Success (200 OK)
+
+[source,json]
+----
+{
+    "sessionToken": "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9...",
+    "mfaRequired": true,
+    "mfaMethods": ["totp", "email"],
+    "message": "Credentials verified. MFA required."
+}
+----
+
+.Response Fields
+[cols="2,2,4", options="header"]
+|===
+|Field |Type |Description
+|`sessionToken` |String |Pre-authenticated session token (valid until MFA completion)
+|`mfaRequired` |Boolean |Whether MFA verification is required
+|`mfaMethods` |Array |Available MFA methods for the user
+|`message` |String |Human-readable status message
+|===
+
+===== Response - Invalid Credentials (401 Unauthorized)
+
+[source,json]
+----
+{
+    "error": "INVALID_CREDENTIALS",
+    "message": "Invalid username or password.",
+    "timestamp": "2025-01-15T10:30:00Z"
+}
+----
+
+===== Response - Account Locked (423 Locked)
+
+[source,json]
+----
+{
+    "error": "ACCOUNT_LOCKED",
+    "message": "Account temporarily locked due to multiple failed attempts. Try again after 30 minutes.",
+    "lockedUntil": "2025-01-15T11:00:00Z",
+    "timestamp": "2025-01-15T10:30:00Z"
+}
+----
+
+===== Response - Rate Limited (429 Too Many Requests)
+
+[source,json]
+----
+{
+    "error": "RATE_LIMITED",
+    "message": "Rate limit exceeded. Please try again later.",
+    "retryAfterSeconds": 60,
+    "timestamp": "2025-01-15T10:30:00Z"
+}
+----
+
+---
+
+[[api-mfa-status]]
+==== GET /api/v1/mfa/status
+
+Check MFA configuration status for the authenticated user.
+
+===== Request
+
+[source,http]
+----
+GET /api/v1/mfa/status HTTP/1.1
+Authorization: Bearer <sessionToken>
+Host: certificate-mgmt.example.com
+----
+
+===== Response - MFA Configured (200 OK)
+
+[source,json]
+----
+{
+    "mfaConfigured": true,
+    "mfaRequired": true,
+    "methods": ["totp", "email"],
+    "primaryMethod": "totp"
+}
+----
+
+===== Response - MFA Not Configured (403 Forbidden)
+
+[source,json]
+----
+{
+    "error": "MFA_SETUP_REQUIRED",
+    "message": "MFA setup required before accessing the system.",
+    "setupUrl": "/api/v1/mfa/setup"
+}
+----
+
+---
+
+[[api-mfa-setup]]
+==== POST /api/v1/mfa/setup
+
+Initialize MFA setup for a user (first-time MFA configuration).
+
+===== Request
+
+[source,http]
+----
+POST /api/v1/mfa/setup HTTP/1.1
+Content-Type: application/json
+Authorization: Bearer <sessionToken>
+Host: certificate-mgmt.example.com
+
+{
+    "method": "totp"
+}
+----
+
+===== Response - Success (200 OK)
+
+[source,json]
+----
+{
+    "method": "totp",
+    "qrCodeUri": "otpauth://totp/CertMgmt:john.doe?secret=JBSWY3DPEHPK3PXP&issuer=CertMgmt",
+    "secret": "JBSWY3DPEHPK3PXP",
+    "recoveryCodes": [
+        "ABC12DE1",
+        "FGH34IJ2",
+        "KLM56NO3",
+        "PQR78ST4",
+        "UVW90XY5",
+        "ZAB12CD6",
+        "EFG34HI7",
+        "JKL56MN8"
+    ],
+    "message": "Scan the QR code with your authenticator app. Save recovery codes securely."
+}
+----
+
+---
+
+[[api-mfa-setup-verify]]
+==== POST /api/v1/mfa/setup/verify
+
+Verify the initial TOTP code during MFA setup to confirm correct configuration.
+
+===== Request
+
+[source,http]
+----
+POST /api/v1/mfa/setup/verify HTTP/1.1
+Content-Type: application/json
+Authorization: Bearer <sessionToken>
+Host: certificate-mgmt.example.com
+
+{
+    "code": "123456"
+}
+----
+
+===== Response - Success (200 OK)
+
+[source,json]
+----
+{
+    "mfaEnabled": true,
+    "message": "MFA setup complete. Your account is now secured with TOTP.",
+    "accessToken": "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9...",
+    "refreshToken": "dGhpcyBpcyBhIHJlZnJlc2ggdG9rZW4...",
+    "dashboardUrl": "/dashboard/operator",
+    "roles": ["ROLE_END_ENTITY"]
+}
+----
+
+===== Response - Invalid Code (401 Unauthorized)
+
+[source,json]
+----
+{
+    "error": "INVALID_CODE",
+    "message": "Invalid verification code. Please try again.",
+    "timestamp": "2025-01-15T10:32:00Z"
+}
+----
+
+---
+
+[[section-2-2]]
+=== 2.2 MFA Verification APIs
+
+[[api-mfa-verify]]
+==== POST /api/v1/mfa/verify
+
+Verify MFA code (TOTP or email OTP) during login flow.
+
+===== Request
+
+[source,http]
+----
+POST /api/v1/mfa/verify HTTP/1.1
+Content-Type: application/json
+Authorization: Bearer <sessionToken>
+Host: certificate-mgmt.example.com
+
+{
+    "method": "totp",
+    "code": "123456"
+}
+----
+
+.Request Fields
+[cols="2,2,4", options="header"]
+|===
+|Field |Type |Description
+|`method` |String |MFA method: `totp` or `email`
+|`code` |String |6-digit verification code
+|===
+
+===== Response - Success (200 OK)
+
+[source,json]
+----
+{
+    "verified": true,
+    "accessToken": "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9...",
+    "refreshToken": "dGhpcyBpcyBhIHJlZnJlc2ggdG9rZW4...",
+    "expiresIn": 1800,
+    "dashboardUrl": "/dashboard/operator",
+    "roles": ["ROLE_END_ENTITY"],
+    "message": "MFA verification successful."
+}
+----
+
+===== Response - Invalid Code (401 Unauthorized)
+
+[source,json]
+----
+{
+    "error": "INVALID_MFA_CODE",
+    "message": "Invalid MFA code.",
+    "attemptsRemaining": 2,
+    "timestamp": "2025-01-15T10:31:00Z"
+}
+----
+
+===== Response - Attempts Exhausted (423 Locked)
+
+[source,json]
+----
+{
+    "error": "MFA_ATTEMPTS_EXHAUSTED",
+    "message": "Maximum MFA attempts exceeded. Please login again.",
+    "redirectUrl": "/login",
+    "timestamp": "2025-01-15T10:33:00Z"
+}
+----
+
+---
+
+[[api-mfa-email-send]]
+==== POST /api/v1/mfa/email/send
+
+Send OTP to user's registered corporate email for MFA verification.
+
+===== Request
+
+[source,http]
+----
+POST /api/v1/mfa/email/send HTTP/1.1
+Authorization: Bearer <sessionToken>
+Host: certificate-mgmt.example.com
+----
+
+===== Response - Success (200 OK)
+
+[source,json]
+----
+{
+    "sent": true,
+    "maskedEmail": "j****e@example.com",
+    "expiresInSeconds": 300,
+    "message": "OTP sent to your registered email."
+}
+----
+
+===== Response - Resend Limit (429 Too Many Requests)
+
+[source,json]
+----
+{
+    "error": "RESEND_LIMIT_REACHED",
+    "message": "Resend limit reached for this session.",
+    "timestamp": "2025-01-15T10:35:00Z"
+}
+----
+
+---
+
+[[api-mfa-recovery]]
+==== POST /api/v1/mfa/recovery
+
+Verify MFA using a recovery code (when authenticator app is unavailable).
+
+===== Request
+
+[source,http]
+----
+POST /api/v1/mfa/recovery HTTP/1.1
+Content-Type: application/json
+Authorization: Bearer <sessionToken>
+Host: certificate-mgmt.example.com
+
+{
+    "recoveryCode": "ABC12DE1"
+}
+----
+
+.Request Fields
+[cols="2,2,4", options="header"]
+|===
+|Field |Type |Description
+|`recoveryCode` |String |8-character alphanumeric recovery code
+|===
+
+===== Response - Success (200 OK)
+
+[source,json]
+----
+{
+    "verified": true,
+    "accessToken": "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9...",
+    "refreshToken": "dGhpcyBpcyBhIHJlZnJlc2ggdG9rZW4...",
+    "dashboardUrl": "/dashboard/operator",
+    "remainingRecoveryCodes": 7,
+    "message": "Logged in via recovery code. You have 7 recovery codes remaining.",
+    "warning": "Consider regenerating recovery codes if running low."
+}
+----
+
+===== Response - Invalid Recovery Code (401 Unauthorized)
+
+[source,json]
+----
+{
+    "error": "INVALID_RECOVERY_CODE",
+    "message": "Invalid recovery code.",
+    "timestamp": "2025-01-15T10:36:00Z"
+}
+----
+
+---
+
+[[chapter-3]]
+== 3: API Endpoint Summary
+
+[cols="1,3,5", options="header"]
+|===
+|Method |Endpoint |Description
+
+|POST |`/api/v1/auth/login` |Authenticate using AD credentials
+|GET |`/api/v1/mfa/status` |Check MFA configuration status
+|POST |`/api/v1/mfa/setup` |Initialize MFA setup (first login)
+|POST |`/api/v1/mfa/setup/verify` |Verify TOTP code during setup
+|POST |`/api/v1/mfa/verify` |Verify MFA code (TOTP or email OTP)
+|POST |`/api/v1/mfa/email/send` |Send email OTP for MFA
+|POST |`/api/v1/mfa/recovery` |Authenticate using recovery code
+|===
+
+---
+
+[[chapter-4]]
+== 4: Error Code Reference
+
+[cols="2,2,4", options="header"]
+|===
+|Error Code |HTTP Status |Description
+
+|`INVALID_CREDENTIALS` |401 |Username or password is incorrect
+|`ACCOUNT_LOCKED` |423 |Account locked after 5 failed attempts
+|`ACCOUNT_DISABLED` |403 |AD account is disabled
+|`RATE_LIMITED` |429 |Too many requests from same IP
+|`SESSION_LIMIT` |409 |Maximum concurrent sessions reached
+|`MFA_SETUP_REQUIRED` |403 |User must configure MFA before access
+|`INVALID_MFA_CODE` |401 |Incorrect TOTP or email OTP code
+|`MFA_ATTEMPTS_EXHAUSTED` |423 |3 MFA attempts exceeded
+|`MFA_CODE_EXPIRED` |401 |Email OTP has expired (5-min TTL)
+|`RESEND_LIMIT_REACHED` |429 |Email OTP resend limit exceeded
+|`INVALID_RECOVERY_CODE` |401 |Recovery code is invalid or used
+|`SESSION_EXPIRED` |401 |Session timed out (30 min inactivity)
+|`INVALID_INPUT` |400 |Request validation failed
+|===
+
+---
+
+[[chapter-5]]
+== 5: Security Considerations
+
+=== 5.1 Authentication Security
+
+* Passwords are *never stored* by the system; authentication is delegated to Active Directory via LDAP bind.
+* All credentials are transmitted over *TLS 1.2+* exclusively.
+* LDAP injection prevention via input sanitization on username field.
+* Account lockout after 5 failed attempts with 30-minute cooldown.
+* Rate limiting at API gateway level (10 requests/minute/IP).
+
+=== 5.2 MFA Security
+
+* TOTP secrets are stored *encrypted at rest* using AES-256.
+* Email OTPs are stored as *salted SHA-256 hashes* with 5-minute TTL.
+* Recovery codes are stored as *bcrypt hashes* and invalidated after single use.
+* MFA verification has a strict 3-attempt limit per session.
+* Clock drift tolerance for TOTP is limited to +/- 1 time window (30 seconds).
+
+=== 5.3 Session Security
+
+* Access tokens (JWT) expire after 30 minutes.
+* Refresh tokens have 24-hour validity with rotation on each use.
+* Maximum 3 concurrent sessions per user enforced.
+* Sessions are stored in Redis with automatic TTL-based expiration.
+* All tokens are transmitted via *httpOnly secure cookies* (not localStorage).
