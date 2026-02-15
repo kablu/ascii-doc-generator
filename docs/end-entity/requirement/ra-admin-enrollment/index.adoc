@@ -1,0 +1,2433 @@
+= RA Admin User Enrollment - Functional Requirement Specification
+:doctype: book
+:icons: font
+:source-highlighter: coderay
+:toc: left
+:toclevels: 4
+:sectlinks:
+:sectnums:
+:chapter-signifier: Chapter
+
+[[chapter-1]]
+== 1: Introduction & Purpose
+
+=== 1.1 Document Purpose
+
+This document is the *Functional Requirement Specification (FRS)* for the *RA Admin User Enrollment* module
+within the Certificate Authority (CA) Registration Authority (RA) Management System. It serves as the
+authoritative reference for all functional behaviour related to the enrolment, authentication, and lifecycle
+management of RA administrative users.
+
+The document is structured as a *Business Requirements Document (BRD)* and is intended to bridge the gap
+between business stakeholders who define what the system must do and the engineering teams who will
+implement, test, and maintain the solution. Every requirement stated herein is traceable, testable, and
+prioritised using the MoSCoW method (MUST, SHOULD, COULD, NICE-TO-HAVE).
+
+=== 1.2 Scope
+
+This specification covers the following functional areas:
+
+. *Root Admin Auto-Creation (Phase 1)* -- The automatic provisioning of a bootstrap administrator account
+  when the RA Application is deployed for the first time.
+. *RA Admin Authentication (Phase 2)* -- The login process by which RA administrative users authenticate
+  using a username and password to obtain a JSON Web Token (JWT).
+. *Admin User Creation (Phase 3)* -- The ability for an authenticated RA_ADMIN to create new administrative
+  users with designated roles through a secured REST API endpoint.
+. *New Admin Login & System Management (Phase 4)* -- The process by which a newly created administrator
+  logs in and exercises their management capabilities within the RA system.
+
+The following areas are explicitly *out of scope* for this document:
+
+* End Entity / User authentication via Active Directory (covered in a separate FRS).
+* Multi-Factor Authentication (MFA) for RA admin users.
+* Certificate lifecycle management (enrolment, renewal, revocation) functional requirements.
+* Infrastructure provisioning and deployment pipeline configuration.
+
+=== 1.3 Intended Audience
+
+[cols="2,5", options="header"]
+|===
+|Audience |Usage
+
+|Business Analysts
+|Validate that the documented requirements accurately reflect the business intent and operational needs of the RA system.
+
+|Solution Architects
+|Use this specification to design the technical architecture, select appropriate frameworks, and define integration boundaries.
+
+|Development Team
+|Implement the REST API endpoints, authentication logic, authorisation enforcement, and data persistence in conformance with the requirements stated herein.
+
+|Quality Assurance
+|Derive test cases and acceptance test plans from the acceptance criteria, validation rules, error codes, and boundary conditions documented in each functional requirement.
+
+|Security Reviewers
+|Assess the security posture of the authentication, authorisation, and data protection mechanisms described in this document.
+
+|Operations / DevOps
+|Understand the deployment-time behaviour (root admin auto-creation) and configuration requirements for the RA application.
+|===
+
+=== 1.4 Glossary of Terms
+
+[cols="2,5", options="header"]
+|===
+|Term |Definition
+
+|CA (Certificate Authority)
+|A trusted entity that issues, manages, and revokes digital certificates used for secure communication and identity verification.
+
+|RA (Registration Authority)
+|A subordinate authority that acts on behalf of a CA to verify the identity of certificate applicants and approve or reject certificate requests.
+
+|RA Admin
+|An administrative user within the RA Management System who has privileges to manage other users, approve/reject certificate requests, and configure the system.
+
+|RBAC (Role-Based Access Control)
+|An access control mechanism where permissions are assigned to roles rather than individual users. Users inherit permissions by being assigned one or more roles.
+
+|JWT (JSON Web Token)
+|A compact, URL-safe token format defined by RFC 7519 used to transmit claims between parties. In this system, JWTs are signed with HS256 and carry user identity and role claims.
+
+|BCrypt
+|A password hashing algorithm based on the Blowfish cipher, designed to be computationally expensive to resist brute-force attacks. Includes a configurable cost factor that controls hashing iterations.
+
+|HS256
+|HMAC using SHA-256, a symmetric signing algorithm used for JWT token signatures. The same secret key is used for both signing and verification.
+
+|PKCE
+|Proof Key for Code Exchange (RFC 7636). Not used in RA Admin authentication; referenced here only for contrast with End Entity authentication flows.
+
+|DataInitializer
+|A component within the RA Application that executes once during application startup to perform bootstrap operations such as creating the initial root admin user.
+
+|Bearer Token
+|An authentication scheme where the client includes a JWT in the HTTP `Authorization` header using the format `Bearer <token>`.
+|===
+
+=== 1.5 Document Conventions
+
+Throughout this document, the following conventions are used:
+
+* *MUST* -- The requirement is mandatory and the system shall not be considered compliant without it.
+* *SHOULD* -- The requirement is strongly recommended but may be deferred under justified circumstances.
+* *COULD* -- The requirement is desirable and would enhance the user experience but is not critical.
+* *Functional Requirement IDs* follow the pattern `FR-RAE-XXX` where RAE stands for RA Admin Enrolment.
+* All HTTP request and response examples are shown as JSON over HTTPS. Actual endpoint paths may be prefixed with a version namespace (e.g., `/api/v1/`).
+
+---
+
+[[chapter-2]]
+== 2: Business Context & Design Principles
+
+=== 2.1 Business Context
+
+Within a Public Key Infrastructure (PKI), the Certificate Authority (CA) is the root of trust that issues digital
+certificates. The *Registration Authority (RA)* operates as a front-line entity that interacts with end entities
+(users, devices, servers) to validate their identity before requesting certificate issuance from the CA. The
+RA Management System is the administrative console through which RA personnel manage certificate lifecycle
+operations, user accounts, and system configuration.
+
+The *RA Admin User Enrolment* process is the foundational capability that bootstraps the administrative
+workforce within the RA system. Without at least one administrative user, the RA system cannot be operated.
+Therefore, the system must provide an automated mechanism to create an initial root administrator during
+the very first deployment, and subsequently allow that root administrator to onboard additional administrative
+users through a secured API.
+
+This design ensures that:
+
+* No manual database intervention is required to make the RA system operational after deployment.
+* The root administrator can immediately authenticate and begin configuring the system.
+* Additional administrators, officers, and operators can be onboarded in a controlled, auditable manner.
+* Every administrative action is traceable to an authenticated user through JWT-based session management.
+
+=== 2.2 Key Design Principle
+
+[IMPORTANT]
+====
+*RA Management Users do NOT use Active Directory.*
+
+Unlike End Entity/User authentication (which relies on corporate Active Directory via LDAP), the RA
+Management User authentication is *entirely self-contained*. This is a deliberate architectural decision
+driven by the following considerations:
+
+* *Separation of Concerns* -- RA administrative users are infrastructure-level accounts that manage the
+  certificate authority's operations. They must not depend on the same identity provider (Active Directory)
+  that serves the end entities whose certificates they manage.
+* *Operational Independence* -- If Active Directory becomes unavailable, RA administrators must still be
+  able to log in to manage the system, revoke compromised certificates, and respond to security incidents.
+* *Security Isolation* -- A compromise of the corporate Active Directory should not automatically grant
+  access to the RA Management System, which holds the keys to certificate issuance and revocation.
+====
+
+=== 2.3 Authentication Model
+
+The RA Admin authentication model is based on the following principles:
+
+* *Password-Based Authentication* -- Users authenticate by providing a username and password. The password
+  is never stored in plaintext; instead, a one-way BCrypt hash is stored in the database.
+* *Stateless Session Management* -- Upon successful authentication, the system issues a JWT token that
+  the client must include in subsequent requests. The server does not maintain server-side sessions; all
+  session state is encoded within the JWT.
+* *Token Expiry* -- Each JWT has a configurable time-to-live (default: 24 hours), after which the user
+  must re-authenticate.
+* *No Refresh Token (Initial Release)* -- For simplicity and security, the initial release does not
+  support refresh tokens. Users re-authenticate when the access token expires.
+
+=== 2.4 Authorisation Model
+
+Authorisation within the RA system follows the *Role-Based Access Control (RBAC)* paradigm:
+
+* Each user is assigned one or more roles at the time of account creation.
+* Each API endpoint is annotated with the minimum role required for access.
+* The JWT token carries the user's roles as claims. On each request, the security filter extracts these
+  roles and evaluates them against the endpoint's access requirements.
+* If the user's roles do not satisfy the endpoint's requirements, the request is rejected with HTTP 403 Forbidden.
+
+=== 2.5 User Role Hierarchy
+
+The RA system defines the following roles, listed in descending order of privilege:
+
+[cols="1,2,5,3", options="header"]
+|===
+|# |Role |Description |Created By
+
+|1
+|RA_ADMIN (root)
+|The initial bootstrap administrator that is auto-created during the first deployment of the RA Application. This account has full system access and is the only account that exists before any manual user creation occurs. The root admin cannot be deleted or demoted through the API.
+|System (auto-created on first deployment)
+
+|2
+|RA_ADMIN
+|A full-privilege administrator who can create and manage other users (including other admins), approve or reject certificate requests, revoke certificates, view audit logs, and modify system configuration. Functionally equivalent to the root admin, but created manually by an existing admin.
+|Created by root admin or any RA_ADMIN
+
+|3
+|RA_OFFICER
+|A certificate operations officer responsible for reviewing and processing certificate enrolment requests, approving or rejecting applications based on identity verification, and viewing certificate status. Cannot create or manage users, and cannot modify system configuration.
+|Created by any RA_ADMIN
+
+|4
+|RA_OPERATOR
+|A day-to-day operations user with limited privileges, typically responsible for monitoring certificate status, generating reports, and performing routine operational tasks. Cannot approve or reject certificate requests.
+|Created by any RA_ADMIN
+
+|5
+|AUDITOR
+|A read-only role designed for compliance and audit personnel. Can view audit logs, user activity reports, and certificate history, but cannot perform any write operations on the system.
+|Created by any RA_ADMIN
+|===
+
+=== 2.6 Technology Stack
+
+[cols="2,4", options="header"]
+|===
+|Component |Technology
+
+|Backend Framework
+|Spring Boot 3.2.x with Spring Security
+
+|Database
+|PostgreSQL (relational data store for user accounts and roles)
+
+|Password Hashing
+|BCrypt with configurable cost factor (default: 10)
+
+|Token Format
+|JSON Web Token (JWT) signed with HS256 (HMAC-SHA256)
+
+|Authorisation Enforcement
+|Spring Security method-level security with role-based pre-authorisation
+
+|API Protocol
+|RESTful JSON over HTTPS (TLS 1.2+)
+
+|Deployment Model
+|Docker container / Kubernetes pod / Standalone JAR
+
+|Audit Logging
+|Structured JSON logging with correlation IDs for traceability
+|===
+
+---
+
+[[chapter-3]]
+== 3: FR-RAE-001 -- Root Admin Auto-Creation (Phase 1)
+
+=== 3.1 Requirement Overview
+
+[cols="2,5", options="header"]
+|===
+|Attribute |Value
+
+|Requirement ID
+|FR-RAE-001
+
+|Title
+|Root Admin Auto-Creation on First Deployment
+
+|Priority
+|MUST
+
+|Status
+|Approved
+
+|Module
+|RA Admin Enrolment -- Phase 1
+|===
+
+=== 3.2 Description
+
+When the RA Application is deployed for the first time, the system must automatically create an initial
+root administrator account during the application startup process. This root administrator serves as the
+*bootstrap identity* from which all subsequent user management operations originate.
+
+The auto-creation process is designed to be *idempotent* -- if the system detects that one or more users
+already exist in the database, the auto-creation logic must not execute. This ensures that the root admin
+is created exactly once, during the very first startup, and subsequent application restarts or redeployments
+do not create duplicate accounts or overwrite the existing root admin's credentials.
+
+The root admin account is created with the following default attributes:
+
+* *Username*: A pre-configured value (default: `ra-admin`), configurable through application properties.
+* *Password*: A BCrypt-hashed version of a configurable default password provided through an environment variable or application property.
+* *Role*: `RA_ADMIN` -- the highest privilege level in the system.
+* *Account Status*: Enabled (`enabled = true`).
+
+=== 3.3 Business Rationale
+
+In traditional enterprise deployments, the creation of an initial administrator often requires a manual
+database INSERT or a separate provisioning script, which introduces operational risk, delays, and the
+possibility of human error. The auto-creation mechanism eliminates this dependency by ensuring that the
+RA system is fully operational immediately after deployment, with a known bootstrap credential that the
+DevOps team can use to log in and begin system configuration.
+
+This is particularly important in automated CI/CD pipelines where human intervention between deployment
+and first use is undesirable.
+
+=== 3.4 User Story
+
+[quote]
+____
+*As a* DevOps Engineer deploying the RA Application for the first time, +
+*I want* the system to automatically create a root administrator account during startup, +
+*So that* I can immediately log in and begin configuring the RA system without manual database intervention.
+____
+
+=== 3.5 Acceptance Criteria
+
+[cols="1,6,2", options="header"]
+|===
+|# |Criterion |Priority
+
+|AC-1
+|On first application startup, the system must check whether the user store is empty (no users exist). If empty, the system must create a root admin account with the configured default username, a BCrypt-hashed default password, role RA_ADMIN, and enabled status set to true.
+|MUST
+
+|AC-2
+|If one or more users already exist in the user store, the auto-creation logic must not execute, and no new users must be created.
+|MUST
+
+|AC-3
+|The default username for the root admin must be configurable through application properties or environment variables. The default value must be `ra-admin`.
+|MUST
+
+|AC-4
+|The default password for the root admin must be configurable through an environment variable. The system must never use a hardcoded password in source code or configuration files committed to version control.
+|MUST
+
+|AC-5
+|The password must be stored as a BCrypt hash with a cost factor of 10 or higher. The plaintext password must never be persisted, logged, or transmitted in any response.
+|MUST
+
+|AC-6
+|The database schema required for user storage (users table, user_roles table) must be automatically created or updated during application startup through ORM schema migration.
+|MUST
+
+|AC-7
+|The auto-creation process must be logged as an audit event, including the username created and a timestamp. The log must not contain the plaintext or hashed password.
+|SHOULD
+|===
+
+=== 3.6 Preconditions
+
+. The RA Application is being deployed for the first time (or the database has been reset to an empty state).
+. The database server (PostgreSQL) is running and accessible from the application.
+. The application properties or environment variables for the default root admin username and password are configured.
+
+=== 3.7 Postconditions
+
+. The `users` and `user_roles` tables exist in the database.
+. Exactly one user record exists in the `users` table with the configured default username, a BCrypt-hashed password, and `enabled = true`.
+. Exactly one role record exists in the `user_roles` table linking the root admin user to the `RA_ADMIN` role.
+. An audit log entry records the creation of the root admin account.
+
+=== 3.8 Detailed Functional Behaviour
+
+The root admin auto-creation process follows this sequence of operations during application startup:
+
+*Step 1 -- Application Context Initialisation.* When the RA Application starts, the Spring framework
+initialises the application context, loading all bean definitions, establishing database connectivity,
+and preparing the ORM layer. The ORM is configured with a schema update strategy that ensures the
+required database tables (`users`, `user_roles`) are created if they do not exist, or updated if the
+schema has changed between versions.
+
+*Step 2 -- DataInitializer Execution.* After the application context is fully loaded, a dedicated
+initialiser component executes as part of the post-construction lifecycle. This component is responsible
+for evaluating whether the bootstrap condition is met (i.e., whether the user store is empty).
+
+*Step 3 -- User Count Evaluation.* The initialiser queries the user store to determine the total number
+of existing user records. This is a simple count operation that returns an integer value.
+
+*Step 4 -- Conditional Branch.*
+
+* If the count is *zero* (no users exist), the system proceeds to Step 5.
+* If the count is *greater than zero* (users already exist), the initialiser terminates without performing
+  any further action. This ensures idempotency.
+
+*Step 5 -- Root Admin Construction.* The system constructs a new user entity with the following attributes:
+
+[cols="2,5", options="header"]
+|===
+|Attribute |Value
+
+|Username
+|Value from application property `ra.admin.default-username` (default: `ra-admin`)
+
+|Password
+|BCrypt hash of the value from environment variable `RA_ADMIN_DEFAULT_PASSWORD`
+
+|Role
+|`RA_ADMIN`
+
+|Enabled
+|`true`
+|===
+
+*Step 6 -- Persistence.* The constructed user entity is saved to the database through the ORM layer.
+The ORM generates the primary key (auto-incremented ID) and persists both the user record and the
+associated role mapping.
+
+*Step 7 -- Audit Logging.* An audit log entry is created recording the event type (ROOT_ADMIN_CREATED),
+the username, the timestamp, and the source (SYSTEM_INITIALIZER). No password-related information is
+included in the log.
+
+=== 3.9 Business Rules
+
+[cols="1,3,6", options="header"]
+|===
+|# |Rule |Description
+
+|BR-1
+|Idempotency
+|The auto-creation logic must be idempotent. Running the application startup multiple times must result in exactly one root admin user, not duplicates.
+
+|BR-2
+|No Hardcoded Secrets
+|The default password must be provided through an environment variable, not hardcoded in source code or committed configuration files.
+
+|BR-3
+|BCrypt Hashing
+|The password must be hashed using BCrypt with a minimum cost factor of 10. The plaintext password must be discarded from memory immediately after hashing.
+
+|BR-4
+|Single Root Admin
+|Only one root admin is created by the auto-creation process. Additional admins must be created manually through the Admin User Creation endpoint (Phase 3).
+
+|BR-5
+|Schema Auto-Migration
+|The database schema must be automatically created or updated on startup. No manual DDL scripts should be required for initial deployment.
+|===
+
+---
+
+[[chapter-4]]
+== 4: FR-RAE-002 -- RA Admin Authentication (Phase 2)
+
+=== 4.1 Requirement Overview
+
+[cols="2,5", options="header"]
+|===
+|Attribute |Value
+
+|Requirement ID
+|FR-RAE-002
+
+|Title
+|RA Admin User Authentication via Username and Password
+
+|Priority
+|MUST
+
+|Status
+|Approved
+
+|Module
+|RA Admin Enrolment -- Phase 2
+|===
+
+=== 4.2 Description
+
+The RA Admin Authentication requirement defines how administrative users authenticate with the RA system
+to obtain a JWT access token. The authentication process is a *stateless, password-based flow* where the
+user submits their username and password to a dedicated login endpoint, and the system validates the
+credentials against the stored BCrypt hash in the PostgreSQL database.
+
+Upon successful authentication, the system generates a signed JWT token containing the user's identity
+(username) and assigned roles. This token is returned to the client and must be included as a Bearer
+token in the `Authorization` header of all subsequent API requests.
+
+The authentication flow is *entirely independent of Active Directory*. Unlike End Entity authentication
+which relies on LDAP bind operations against corporate AD, the RA Admin authentication operates against
+a self-contained user store in PostgreSQL. This design ensures that RA administrators can continue to
+operate the system even during Active Directory outages.
+
+=== 4.3 Business Rationale
+
+The RA Admin Authentication endpoint is the primary gateway to all RA management functionality. Without
+a valid JWT token, no administrative operation can be performed. The authentication mechanism must
+therefore be highly reliable, secure against common attack vectors (credential stuffing, brute force,
+timing attacks), and produce clear, actionable error messages when authentication fails.
+
+The choice of stateless JWT-based authentication eliminates the need for server-side session storage,
+simplifying horizontal scaling and reducing operational complexity in containerised deployments where
+multiple application instances serve requests behind a load balancer.
+
+=== 4.4 User Story
+
+[quote]
+____
+*As an* RA Administrator (root or non-root), +
+*I want to* authenticate using my username and password via a REST API endpoint, +
+*So that* I receive a JWT token that grants me access to RA management endpoints based on my assigned role.
+____
+
+=== 4.5 Acceptance Criteria
+
+[cols="1,6,2", options="header"]
+|===
+|# |Criterion |Priority
+
+|AC-1
+|The system must provide a public REST API endpoint `POST /api/v1/auth/login` that accepts a JSON request body containing `username` and `password` fields.
+|MUST
+
+|AC-2
+|The system must look up the user by username in the PostgreSQL user store. The lookup must be case-sensitive.
+|MUST
+
+|AC-3
+|The system must verify the provided password against the stored BCrypt hash using a constant-time comparison to prevent timing attacks.
+|MUST
+
+|AC-4
+|On successful authentication, the system must return HTTP 200 OK with a JSON response containing a JWT token (signed with HS256), the user's roles, and the token expiration time in seconds.
+|MUST
+
+|AC-5
+|The JWT token must contain the following claims: `sub` (username), `roles` (array of role strings), `iss` (issuer identifier, e.g., "RA-System"), `iat` (issued-at timestamp), and `exp` (expiration timestamp, default 24 hours from issuance).
+|MUST
+
+|AC-6
+|On invalid credentials (username not found or password mismatch), the system must return HTTP 401 Unauthorized with a generic error message that does not reveal whether the username or the password was incorrect.
+|MUST
+
+|AC-7
+|If the user account exists but is disabled (`enabled = false`), the system must return HTTP 401 Unauthorized with a message indicating the account is disabled.
+|MUST
+
+|AC-8
+|All authentication attempts (successful and failed) must be recorded as audit events with the following attributes: timestamp, username, source IP address, user agent, and result (SUCCESS, INVALID_CREDENTIALS, ACCOUNT_DISABLED, VALIDATION_FAILURE).
+|MUST
+
+|AC-9
+|The login endpoint must enforce rate limiting to mitigate brute-force and credential-stuffing attacks. The recommended limit is 10 requests per minute per source IP address.
+|SHOULD
+
+|AC-10
+|The system must implement account lockout after 5 consecutive failed login attempts. The lockout duration must be 30 minutes, after which the account is automatically unlocked.
+|SHOULD
+|===
+
+=== 4.6 Preconditions
+
+. The RA Application is deployed and running.
+. At least one user exists in the database (the root admin, created during Phase 1).
+. The JWT signing secret is configured and available to the application.
+
+=== 4.7 Postconditions (Success Path)
+
+. The client receives a valid JWT token signed with HS256.
+. The JWT token contains the correct `sub`, `roles`, `iss`, `iat`, and `exp` claims.
+. An audit log entry records the successful authentication event.
+. The failed login counter for the user is reset to zero.
+
+=== 4.8 Postconditions (Failure Path)
+
+. No JWT token is issued.
+. The client receives an appropriate HTTP error status code with a descriptive error message.
+. An audit log entry records the failed authentication event.
+. The failed login counter for the user is incremented (if applicable).
+
+=== 4.9 Detailed Functional Behaviour
+
+*Step 1 -- Receive Login Request.* The client sends an HTTP POST request to `/api/v1/auth/login` with
+a JSON body containing `username` and `password` fields. The request must have `Content-Type: application/json`.
+
+*Step 2 -- Input Validation.* The system validates the request body:
+
+* Both `username` and `password` must be present and non-empty.
+* The `username` must be between 3 and 50 characters, containing only alphanumeric characters, dots, and underscores.
+* The `password` must be between 8 and 128 characters.
+* If validation fails, the system returns HTTP 400 Bad Request with details of the validation failure.
+
+*Step 3 -- Rate Limit Check.* The system checks whether the source IP address has exceeded the rate
+limit (10 requests per minute). If the limit is exceeded, the system returns HTTP 429 Too Many Requests
+without performing any further processing.
+
+*Step 4 -- Account Lockout Check.* The system checks whether the requested user account is currently
+locked due to consecutive failed login attempts. If the account is locked and the lockout period has not
+expired, the system returns HTTP 423 Locked with information about when the lockout expires.
+
+*Step 5 -- User Lookup.* The system queries the user store for a record matching the provided username
+(case-sensitive match). If no matching user is found, the system returns HTTP 401 Unauthorized with the
+generic message "Invalid username or password." The system must not reveal that the username does not
+exist.
+
+*Step 6 -- Account Status Check.* If the user is found but the `enabled` flag is `false`, the system
+returns HTTP 401 Unauthorized with the message "Account is disabled. Contact your administrator."
+
+*Step 7 -- Password Verification.* The system performs a BCrypt comparison between the provided password
+and the stored hash. The comparison uses a constant-time algorithm to prevent timing-based side-channel
+attacks. If the password does not match, the system increments the failed login counter for the user and
+returns HTTP 401 Unauthorized with the generic message "Invalid username or password."
+
+*Step 8 -- JWT Generation.* Upon successful password verification, the system generates a JWT token with
+the following characteristics:
+
+[cols="2,5", options="header"]
+|===
+|Claim |Description
+
+|`sub`
+|The authenticated user's username (e.g., "ra-admin").
+
+|`roles`
+|An array of role strings assigned to the user (e.g., `["RA_ADMIN"]`).
+
+|`iss`
+|The issuer identifier: "RA-System".
+
+|`iat`
+|The issued-at timestamp (Unix epoch seconds).
+
+|`exp`
+|The expiration timestamp, calculated as `iat + 86400` (24 hours from issuance).
+|===
+
+The token is signed using the HS256 algorithm with a server-side secret key.
+
+*Step 9 -- Response.* The system returns HTTP 200 OK with a JSON response containing the JWT token,
+the user's roles, and the token TTL in seconds.
+
+*Step 10 -- Audit Logging.* Regardless of the outcome, the system records an audit event with the
+authentication attempt details: timestamp, username, source IP, user agent, and result.
+
+=== 4.10 Request Body Structure
+
+[source,http]
+----
+POST /api/v1/auth/login HTTP/1.1
+Content-Type: application/json
+Host: ra-system.example.com
+
+{
+    "username": "ra-admin",
+    "password": "SecureP@ssw0rd"
+}
+----
+
+.Request Fields
+[cols="2,2,1,5", options="header"]
+|===
+|Field |Type |Required |Description
+
+|`username`
+|String
+|Yes
+|The RA admin username. Must be 3-50 characters, alphanumeric with dots and underscores only. Case-sensitive.
+
+|`password`
+|String
+|Yes
+|The user's password. Must be 8-128 characters. Transmitted over HTTPS only.
+|===
+
+=== 4.11 Response Body Structures
+
+==== Success Response (HTTP 200 OK)
+
+[source,json]
+----
+{
+    "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJyYS1hZG1pbiIsInJvbGVzIjpbIlJBX0FETUlOIl0sImlzcyI6IlJBLVN5c3RlbSIsImV4cCI6MTcwNTM5ODQwMCwiaWF0IjoxNzA1MzEyMDAwfQ.signature",
+    "roles": ["RA_ADMIN"],
+    "expiresIn": 86400,
+    "tokenType": "Bearer"
+}
+----
+
+.Response Fields
+[cols="2,2,5", options="header"]
+|===
+|Field |Type |Description
+
+|`token`
+|String
+|The JWT access token signed with HS256. Must be included as `Authorization: Bearer <token>` in subsequent requests.
+
+|`roles`
+|Array of Strings
+|The list of roles assigned to the authenticated user.
+
+|`expiresIn`
+|Number
+|Token time-to-live in seconds. Default: 86400 (24 hours).
+
+|`tokenType`
+|String
+|The token type. Always `Bearer`.
+|===
+
+==== Error Response -- Invalid Credentials (HTTP 401 Unauthorized)
+
+[source,json]
+----
+{
+    "error": "INVALID_CREDENTIALS",
+    "message": "Invalid username or password.",
+    "timestamp": "2025-01-15T10:30:00Z",
+    "path": "/api/v1/auth/login"
+}
+----
+
+==== Error Response -- Account Disabled (HTTP 401 Unauthorized)
+
+[source,json]
+----
+{
+    "error": "ACCOUNT_DISABLED",
+    "message": "Account is disabled. Contact your administrator.",
+    "timestamp": "2025-01-15T10:30:00Z",
+    "path": "/api/v1/auth/login"
+}
+----
+
+==== Error Response -- Validation Failure (HTTP 400 Bad Request)
+
+[source,json]
+----
+{
+    "error": "VALIDATION_FAILURE",
+    "message": "Request validation failed.",
+    "details": [
+        "Username is required and must be 3-50 characters.",
+        "Password is required and must be at least 8 characters."
+    ],
+    "timestamp": "2025-01-15T10:30:00Z",
+    "path": "/api/v1/auth/login"
+}
+----
+
+==== Error Response -- Account Locked (HTTP 423 Locked)
+
+[source,json]
+----
+{
+    "error": "ACCOUNT_LOCKED",
+    "message": "Account temporarily locked due to multiple failed login attempts. Try again after 30 minutes.",
+    "lockedUntil": "2025-01-15T11:00:00Z",
+    "timestamp": "2025-01-15T10:30:00Z",
+    "path": "/api/v1/auth/login"
+}
+----
+
+==== Error Response -- Rate Limited (HTTP 429 Too Many Requests)
+
+[source,json]
+----
+{
+    "error": "RATE_LIMITED",
+    "message": "Too many login attempts. Please try again later.",
+    "retryAfterSeconds": 60,
+    "timestamp": "2025-01-15T10:30:00Z",
+    "path": "/api/v1/auth/login"
+}
+----
+
+=== 4.12 Client-Side Validation Rules
+
+[cols="2,4,3", options="header"]
+|===
+|Field |Validation Rule |Error Message
+
+|Username
+|Required. Must not be empty or null.
+|"Username is required."
+
+|Username
+|Minimum 3 characters. Maximum 50 characters.
+|"Username must be between 3 and 50 characters."
+
+|Username
+|Alphanumeric characters, dots (`.`), and underscores (`_`) only.
+|"Username contains invalid characters."
+
+|Username
+|Must not contain leading or trailing whitespace.
+|"Username must not contain leading or trailing spaces."
+
+|Password
+|Required. Must not be empty or null.
+|"Password is required."
+
+|Password
+|Minimum 8 characters. Maximum 128 characters.
+|"Password must be between 8 and 128 characters."
+
+|Password
+|Must not be blank (contains only whitespace).
+|"Password cannot be blank."
+|===
+
+=== 4.13 Server-Side Validation Rules
+
+[cols="3,4,3", options="header"]
+|===
+|Validation |Rule |Error Response
+
+|Input Presence
+|Both `username` and `password` fields must be present in the JSON request body.
+|HTTP 400 -- "Username and password are required."
+
+|Input Format
+|`username` must match the pattern `^[a-zA-Z0-9._]{3,50}$`.
+|HTTP 400 -- "Username format is invalid."
+
+|Input Sanitisation
+|All string inputs must be sanitised to prevent injection attacks (SQL injection, XSS). Special characters must be escaped or rejected.
+|HTTP 400 -- "Invalid characters in input."
+
+|Rate Limiting
+|Maximum 10 login requests per minute per source IP address.
+|HTTP 429 -- "Too many login attempts. Please try again later."
+
+|Account Lockout
+|If the user has 5 or more consecutive failed login attempts within the lockout window, reject the login without checking credentials.
+|HTTP 423 -- "Account temporarily locked."
+
+|User Existence
+|The username must correspond to an existing record in the user store.
+|HTTP 401 -- "Invalid username or password." (generic message)
+
+|Account Status
+|The user's `enabled` flag must be `true`.
+|HTTP 401 -- "Account is disabled. Contact your administrator."
+
+|Password Verification
+|The provided password must match the stored BCrypt hash via constant-time comparison.
+|HTTP 401 -- "Invalid username or password." (generic message)
+
+|JWT Generation
+|Upon successful authentication, a JWT must be generated with valid `sub`, `roles`, `iss`, `iat`, and `exp` claims and signed with HS256.
+|N/A (internal operation)
+|===
+
+=== 4.14 Database-Level Validation Rules
+
+[cols="3,4,3", options="header"]
+|===
+|Constraint |Rule |Impact on Authentication
+
+|Username Uniqueness
+|The `username` column in the users table has a UNIQUE constraint. No two users can share the same username.
+|Ensures the user lookup returns at most one record, preventing ambiguity.
+
+|Username NOT NULL
+|The `username` column does not accept NULL values.
+|Guarantees every user record has an identifiable username.
+
+|Password Hash NOT NULL
+|The `password_hash` column does not accept NULL values.
+|Ensures every user has a hashed password available for BCrypt comparison.
+
+|Enabled NOT NULL with Default
+|The `enabled` column does not accept NULL values and defaults to `true`.
+|Guarantees the account status check always has a definitive boolean value.
+
+|Role Referential Integrity
+|The `user_roles` table references the `users` table via a foreign key. Roles cannot exist without a valid user.
+|Ensures the roles extracted from the database during JWT generation are always associated with a valid user.
+|===
+
+=== 4.15 Business Rules
+
+[cols="1,3,6", options="header"]
+|===
+|# |Rule |Description
+
+|BR-1
+|Generic Error Messages
+|Authentication error messages must not reveal whether the failure was due to a non-existent username or an incorrect password. The generic message "Invalid username or password." must be returned in both cases to prevent username enumeration.
+
+|BR-2
+|Constant-Time Comparison
+|Password verification must use a constant-time comparison algorithm to prevent timing-based side-channel attacks that could reveal whether a username exists in the system.
+
+|BR-3
+|Account Lockout Policy
+|After 5 consecutive failed login attempts, the account must be locked for 30 minutes. The lockout counter resets to zero upon a successful login. The lockout is time-based and automatically expires.
+
+|BR-4
+|Audit Trail
+|Every authentication attempt must produce an audit record regardless of the outcome. The audit record must include: timestamp, username, source IP address, user agent, and result code.
+
+|BR-5
+|No Plaintext Passwords in Logs
+|Passwords must never appear in application logs, audit logs, error messages, or API responses -- not even in masked form.
+
+|BR-6
+|Token Expiry
+|JWT tokens expire after 24 hours (configurable). Expired tokens must be rejected by the security filter on subsequent requests.
+|===
+
+---
+
+[[chapter-5]]
+== 5: FR-RAE-003 -- Admin User Creation (Phase 3)
+
+=== 5.1 Requirement Overview
+
+[cols="2,5", options="header"]
+|===
+|Attribute |Value
+
+|Requirement ID
+|FR-RAE-003
+
+|Title
+|Create New RA Management User
+
+|Priority
+|MUST
+
+|Status
+|Approved
+
+|Module
+|RA Admin Enrolment -- Phase 3
+|===
+
+=== 5.2 Description
+
+The Admin User Creation requirement defines the ability for an authenticated user with the `RA_ADMIN`
+role to create new RA management user accounts through a secured REST API endpoint. This is the primary
+mechanism for onboarding additional administrators, officers, operators, and auditors into the RA system
+after the initial root admin account has been established.
+
+The endpoint is protected by two layers of security:
+
+. *JWT Authentication* -- The request must include a valid, non-expired JWT token in the `Authorization`
+  header. The JWT Authentication Filter extracts and validates the token before the request reaches the
+  controller.
+. *Role-Based Authorisation* -- After authentication, the system verifies that the authenticated user
+  has the `RA_ADMIN` role. Only users with this role are permitted to create new accounts.
+
+The creation process includes comprehensive input validation, duplicate username detection, password
+hashing, and role assignment. The system returns the created user's profile (excluding the password)
+upon success.
+
+=== 5.3 Business Rationale
+
+As the RA system scales beyond the initial root administrator, the organisation needs a secure, auditable
+mechanism to onboard additional personnel. The Admin User Creation endpoint provides this capability
+while enforcing the principle of least privilege -- only administrators can create accounts, and the
+system validates all inputs to prevent data integrity issues.
+
+This approach is preferred over direct database insertion for the following reasons:
+
+* *Auditability* -- Every user creation is traceable to the admin who performed it, with a full audit trail.
+* *Validation* -- The API enforces business rules (password complexity, unique usernames, valid roles) that raw database operations would bypass.
+* *Security* -- The API ensures passwords are hashed before storage, roles are validated against the allowed set, and only authorised users can perform the operation.
+
+=== 5.4 User Story
+
+[quote]
+____
+*As an* authenticated RA_ADMIN, +
+*I want to* create new RA management users with specified roles through a REST API endpoint, +
+*So that* additional administrators, officers, operators, and auditors can be onboarded to the RA system in a controlled and auditable manner.
+____
+
+=== 5.5 Acceptance Criteria
+
+[cols="1,6,2", options="header"]
+|===
+|# |Criterion |Priority
+
+|AC-1
+|The system must provide a secured REST API endpoint `POST /api/v1/admin/users` that accepts a JSON request body containing `username`, `password`, `commonName`, `email`, and `roles` fields.
+|MUST
+
+|AC-2
+|The endpoint must require a valid JWT token in the `Authorization: Bearer <token>` header. Requests without a token or with an invalid/expired token must be rejected with HTTP 401 Unauthorized.
+|MUST
+
+|AC-3
+|The endpoint must enforce role-based authorisation: only users with the `RA_ADMIN` role may access it. Non-admin users must receive HTTP 403 Forbidden.
+|MUST
+
+|AC-4
+|The system must validate all input fields according to the validation rules defined in this document. Invalid input must result in HTTP 400 Bad Request with specific error details.
+|MUST
+
+|AC-5
+|The system must check for duplicate usernames before creating a new user. If a user with the same username already exists, the system must return HTTP 409 Conflict.
+|MUST
+
+|AC-6
+|The provided password must be hashed using BCrypt (cost factor 10 or higher) before storage. The plaintext password must not be persisted, logged, or returned in any response.
+|MUST
+
+|AC-7
+|On successful creation, the system must return HTTP 201 Created with a JSON response containing the new user's `username` and `roles`. The response must not include the password or its hash.
+|MUST
+
+|AC-8
+|The user creation event must be recorded as an audit log entry, including: the acting admin's username, the new user's username, the assigned roles, and a timestamp.
+|MUST
+
+|AC-9
+|An RA_ADMIN must be able to assign any valid role to the new user, including `RA_ADMIN`. The valid roles are: `RA_ADMIN`, `RA_OFFICER`, `RA_OPERATOR`, `AUDITOR`.
+|MUST
+
+|AC-10
+|The system must support assigning multiple roles to a single user in one creation request.
+|SHOULD
+|===
+
+=== 5.6 Preconditions
+
+. The RA Application is deployed and running.
+. The requesting user is authenticated with a valid, non-expired JWT token.
+. The requesting user has the `RA_ADMIN` role.
+
+=== 5.7 Postconditions (Success Path)
+
+. A new user record exists in the `users` table with the specified username, BCrypt-hashed password, common name, email, and enabled status.
+. One or more role records exist in the `user_roles` table linking the new user to the specified roles.
+. An audit log entry records the creation event with the acting admin's identity.
+. The new user can immediately authenticate using the credentials provided during creation.
+
+=== 5.8 Postconditions (Failure Path)
+
+. No new user record is created in the database.
+. The client receives an appropriate HTTP error status with a descriptive error message.
+. An audit log entry records the failed creation attempt.
+
+=== 5.9 Detailed Functional Behaviour
+
+*Step 1 -- Receive Request.* The client sends an HTTP POST request to `/api/v1/admin/users` with
+a JSON body and an `Authorization: Bearer <token>` header.
+
+*Step 2 -- JWT Authentication Filter.* The security filter intercepts the request, extracts the Bearer
+token from the `Authorization` header, and performs the following checks:
+
+* The token must be present and properly formatted.
+* The JWT signature must be valid (verified using the HS256 secret key).
+* The `exp` claim must be in the future (token not expired).
+* The `sub` and `roles` claims must be present.
+
+If any check fails, the filter returns HTTP 401 Unauthorized immediately, before the request reaches
+the controller.
+
+*Step 3 -- Role Authorisation.* After successful JWT validation, the system extracts the `roles` claim
+from the token and evaluates whether the authenticated user has the `RA_ADMIN` role. If the user does
+not have this role, the system returns HTTP 403 Forbidden.
+
+*Step 4 -- Input Validation.* The system validates all fields in the request body:
+
+* `username`: Required, 3-50 characters, alphanumeric with dots and underscores only.
+* `password`: Required, 8-128 characters, must contain at least one uppercase letter, one lowercase letter, one digit, and one special character.
+* `commonName`: Required, 2-100 characters.
+* `email`: Required, valid email format per RFC 5322.
+* `roles`: Required, non-empty array, each value must be one of the valid role names.
+
+If any validation fails, the system returns HTTP 400 Bad Request with an array of specific error messages.
+
+*Step 5 -- Duplicate Check.* The system queries the user store to determine whether a user with the
+requested username already exists. If a duplicate is found, the system returns HTTP 409 Conflict.
+
+*Step 6 -- Password Hashing.* The system hashes the provided password using BCrypt with the configured
+cost factor (minimum 10). The plaintext password is discarded from memory after hashing.
+
+*Step 7 -- User Persistence.* The system creates a new user entity with the validated data and the
+hashed password, assigns the specified roles, and persists the record to the database. The ORM layer
+generates the primary key and manages the foreign key relationship between the `users` and `user_roles` tables.
+
+*Step 8 -- Response.* The system returns HTTP 201 Created with a JSON response containing the new
+user's `username` and `roles`. The password is not included in the response.
+
+*Step 9 -- Audit Logging.* The system records an audit event with: event type (USER_CREATED), acting
+admin's username, new user's username, assigned roles, and timestamp.
+
+=== 5.10 Request Body Structure
+
+[source,http]
+----
+POST /api/v1/admin/users HTTP/1.1
+Content-Type: application/json
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+Host: ra-system.example.com
+
+{
+    "username": "new-admin",
+    "password": "Secure#Pass1",
+    "commonName": "New Administrator",
+    "email": "newadmin@company.com",
+    "roles": ["RA_ADMIN"]
+}
+----
+
+.Request Fields
+[cols="2,2,1,5", options="header"]
+|===
+|Field |Type |Required |Description
+
+|`username`
+|String
+|Yes
+|Unique username for the new user. 3-50 characters, alphanumeric with dots and underscores only.
+
+|`password`
+|String
+|Yes
+|Password for the new user. 8-128 characters. Must contain at least one uppercase letter, one lowercase letter, one digit, and one special character.
+
+|`commonName`
+|String
+|Yes
+|The user's display name. 2-100 characters.
+
+|`email`
+|String
+|Yes
+|The user's email address. Must be a valid email format.
+
+|`roles`
+|Array of Strings
+|Yes
+|Roles to assign. Valid values: `RA_ADMIN`, `RA_OFFICER`, `RA_OPERATOR`, `AUDITOR`. Must contain at least one role.
+|===
+
+.Request Headers
+[cols="2,2,5", options="header"]
+|===
+|Header |Required |Description
+
+|`Authorization`
+|Yes
+|`Bearer <JWT_TOKEN>`. The JWT must be valid, non-expired, and contain the `RA_ADMIN` role.
+
+|`Content-Type`
+|Yes
+|Must be `application/json`.
+|===
+
+=== 5.11 Response Body Structures
+
+==== Success Response (HTTP 201 Created)
+
+[source,json]
+----
+{
+    "username": "new-admin",
+    "commonName": "New Administrator",
+    "email": "newadmin@company.com",
+    "roles": ["RA_ADMIN"],
+    "enabled": true,
+    "createdAt": "2025-01-15T10:30:00Z",
+    "createdBy": "ra-admin"
+}
+----
+
+==== Error Response -- Unauthorized (HTTP 401)
+
+[source,json]
+----
+{
+    "error": "UNAUTHORIZED",
+    "message": "Invalid or expired token.",
+    "timestamp": "2025-01-15T10:30:00Z",
+    "path": "/api/v1/admin/users"
+}
+----
+
+==== Error Response -- Forbidden (HTTP 403)
+
+[source,json]
+----
+{
+    "error": "FORBIDDEN",
+    "message": "Access denied. RA_ADMIN role is required to create users.",
+    "timestamp": "2025-01-15T10:30:00Z",
+    "path": "/api/v1/admin/users"
+}
+----
+
+==== Error Response -- Validation Failure (HTTP 400)
+
+[source,json]
+----
+{
+    "error": "VALIDATION_FAILURE",
+    "message": "Request validation failed.",
+    "details": [
+        "Password must contain at least one uppercase letter.",
+        "Password must contain at least one special character.",
+        "Email format is invalid."
+    ],
+    "timestamp": "2025-01-15T10:30:00Z",
+    "path": "/api/v1/admin/users"
+}
+----
+
+==== Error Response -- Duplicate Username (HTTP 409 Conflict)
+
+[source,json]
+----
+{
+    "error": "DUPLICATE_USERNAME",
+    "message": "A user with the username 'new-admin' already exists.",
+    "timestamp": "2025-01-15T10:30:00Z",
+    "path": "/api/v1/admin/users"
+}
+----
+
+==== Error Response -- Internal Server Error (HTTP 500)
+
+[source,json]
+----
+{
+    "error": "INTERNAL_SERVER_ERROR",
+    "message": "An unexpected error occurred. Please contact your system administrator.",
+    "timestamp": "2025-01-15T10:30:00Z",
+    "path": "/api/v1/admin/users"
+}
+----
+
+=== 5.12 Client-Side Validation Rules
+
+[cols="2,4,3", options="header"]
+|===
+|Field |Validation Rule |Error Message
+
+|Username
+|Required. 3-50 characters. Alphanumeric with dots and underscores only.
+|"Username is required and must be 3-50 alphanumeric characters."
+
+|Password
+|Required. 8-128 characters.
+|"Password is required and must be 8-128 characters."
+
+|Password
+|Must contain at least one uppercase letter.
+|"Password must contain at least one uppercase letter."
+
+|Password
+|Must contain at least one lowercase letter.
+|"Password must contain at least one lowercase letter."
+
+|Password
+|Must contain at least one digit.
+|"Password must contain at least one digit."
+
+|Password
+|Must contain at least one special character (`@`, `#`, `$`, `%`, `!`, etc.).
+|"Password must contain at least one special character."
+
+|Common Name
+|Required. 2-100 characters.
+|"Display name is required and must be 2-100 characters."
+
+|Email
+|Required. Must match a valid email format.
+|"A valid email address is required."
+
+|Roles
+|Required. Must select at least one role from the valid set.
+|"At least one role must be selected."
+|===
+
+=== 5.13 Server-Side Validation Rules
+
+[cols="3,4,3", options="header"]
+|===
+|Validation |Rule |Error Response
+
+|JWT Token Presence
+|`Authorization` header must contain `Bearer <token>`.
+|HTTP 401 -- "Missing or invalid authorization header."
+
+|JWT Signature
+|Token must be a valid HS256-signed JWT verifiable with the server's secret key.
+|HTTP 401 -- "Invalid token signature."
+
+|JWT Expiration
+|The `exp` claim must be in the future.
+|HTTP 401 -- "Token has expired."
+
+|Role Authorisation
+|The `roles` claim in the JWT must include `RA_ADMIN`.
+|HTTP 403 -- "Access denied. RA_ADMIN role is required."
+
+|Username Format
+|The `username` field must match `^[a-zA-Z0-9._]{3,50}$`.
+|HTTP 400 -- "Username format is invalid."
+
+|Password Complexity
+|The `password` must meet all complexity requirements (uppercase, lowercase, digit, special character, 8-128 chars).
+|HTTP 400 -- Specific validation error messages for each failed rule.
+
+|Email Format
+|The `email` must be a valid RFC 5322 email address.
+|HTTP 400 -- "Email format is invalid."
+
+|Role Validity
+|Each role in the `roles` array must be one of: `RA_ADMIN`, `RA_OFFICER`, `RA_OPERATOR`, `AUDITOR`.
+|HTTP 400 -- "Invalid role: <role_name>. Valid roles are: RA_ADMIN, RA_OFFICER, RA_OPERATOR, AUDITOR."
+
+|Duplicate Username
+|The `username` must not already exist in the user store.
+|HTTP 409 -- "A user with this username already exists."
+
+|Input Sanitisation
+|All string inputs must be sanitised to prevent SQL injection, XSS, and other injection attacks.
+|HTTP 400 -- "Invalid characters in input."
+|===
+
+=== 5.14 Database-Level Validation Rules
+
+[cols="3,4,3", options="header"]
+|===
+|Constraint |Rule |Impact
+
+|Username UNIQUE
+|The `username` column has a UNIQUE constraint. The database rejects any INSERT that would create a duplicate username.
+|Serves as a last-resort safeguard for the application-level duplicate check. If the application-level check passes but a concurrent request creates the same username, the database constraint prevents data corruption.
+
+|Username NOT NULL
+|The `username` column does not accept NULL values.
+|Guarantees every user has an identifiable username.
+
+|Password Hash NOT NULL
+|The `password_hash` column does not accept NULL values.
+|Ensures every user account has a password hash. Accounts without passwords cannot exist.
+
+|Email Format (Application-Level)
+|No database-level email format constraint. Email validation is enforced at the application level.
+|The database stores the email as a plain VARCHAR. Format validation is the application's responsibility.
+
+|Role Foreign Key
+|The `user_roles` table has a foreign key referencing the `users` table. A role assignment cannot exist for a non-existent user.
+|Ensures referential integrity between users and their roles.
+
+|Role Composite Primary Key
+|The `user_roles` table has a composite primary key of (`user_id`, `role`). The same role cannot be assigned twice to the same user.
+|Prevents duplicate role assignments at the database level.
+
+|Enabled Default
+|The `enabled` column defaults to `true` and does not accept NULL values.
+|New users are enabled by default unless explicitly set otherwise.
+|===
+
+=== 5.15 Business Rules
+
+[cols="1,3,6", options="header"]
+|===
+|# |Rule |Description
+
+|BR-1
+|RA_ADMIN Only
+|Only users with the `RA_ADMIN` role can create new users. No other role has this privilege.
+
+|BR-2
+|Admin Can Create Admin
+|An RA_ADMIN can create another RA_ADMIN. There is no restriction preventing the creation of users with equal privilege.
+
+|BR-3
+|Unique Usernames
+|Each username must be unique across the entire system. The system must check for duplicates at the application level before attempting database insertion.
+
+|BR-4
+|Password Complexity
+|New user passwords must meet the following complexity requirements: minimum 8 characters, at least one uppercase letter, at least one lowercase letter, at least one digit, and at least one special character.
+
+|BR-5
+|Password Never Returned
+|The password (plaintext or hashed) must never appear in any API response, log entry, or error message.
+
+|BR-6
+|Immediate Usability
+|A newly created user must be able to authenticate immediately after creation using the credentials provided during the creation request.
+
+|BR-7
+|Audit Trail
+|Every user creation attempt (success or failure) must be recorded with the acting admin's identity, the target username, the assigned roles, and a timestamp.
+|===
+
+---
+
+[[chapter-6]]
+== 6: FR-RAE-004 -- New Admin Login & System Management (Phase 4)
+
+=== 6.1 Requirement Overview
+
+[cols="2,5", options="header"]
+|===
+|Attribute |Value
+
+|Requirement ID
+|FR-RAE-004
+
+|Title
+|New Admin Login and RA System Management Access
+
+|Priority
+|MUST
+
+|Status
+|Approved
+
+|Module
+|RA Admin Enrolment -- Phase 4
+|===
+
+=== 6.2 Description
+
+After a new RA_ADMIN user is created (Phase 3), the newly onboarded administrator must be able to
+authenticate and access the full range of RA management capabilities. The authentication flow for a
+newly created admin is *functionally identical* to the root admin login flow described in FR-RAE-002
+(Phase 2). The same endpoint (`POST /api/v1/auth/login`), the same validation rules, the same JWT
+generation logic, and the same error handling apply.
+
+This requirement confirms that the user creation process (Phase 3) produces a fully functional user
+account that integrates seamlessly with the existing authentication mechanism, and that the JWT token
+issued to the new admin carries the correct role claims to enable access to all RA_ADMIN-restricted
+endpoints.
+
+=== 6.3 Business Rationale
+
+The value of the RA Admin Enrolment process is only realised when newly created administrators can
+independently authenticate and begin managing the system. This phase validates the end-to-end integrity
+of the enrolment lifecycle: from root admin auto-creation, through authentication, to user creation,
+and finally to the new user's independent operation.
+
+=== 6.4 User Story
+
+[quote]
+____
+*As a* newly created RA_ADMIN user, +
+*I want to* log in with the credentials that were set during my account creation, +
+*So that* I can access the RA management system and perform administrative tasks independently.
+____
+
+=== 6.5 Acceptance Criteria
+
+[cols="1,6,2", options="header"]
+|===
+|# |Criterion |Priority
+
+|AC-1
+|A newly created RA_ADMIN must be able to authenticate using `POST /api/v1/auth/login` with the username and password that were specified during their account creation.
+|MUST
+
+|AC-2
+|The authentication flow must be functionally identical to the root admin login (FR-RAE-002). The same validation, error handling, and JWT generation logic must apply.
+|MUST
+
+|AC-3
+|The JWT token issued to the new admin must contain `roles: ["RA_ADMIN"]` (or the appropriate roles assigned during creation).
+|MUST
+
+|AC-4
+|Upon successful authentication, the new admin must have access to all endpoints permitted for their assigned roles, including `POST /api/v1/admin/users` (if they have the RA_ADMIN role).
+|MUST
+
+|AC-5
+|The new admin must be able to create additional users, effectively continuing the admin enrolment chain without requiring the root admin's involvement.
+|SHOULD
+|===
+
+=== 6.6 RA_ADMIN Capabilities
+
+An authenticated user with the `RA_ADMIN` role has the following functional capabilities within the RA system:
+
+[cols="1,3,6", options="header"]
+|===
+|# |Capability |Description
+
+|1
+|Create and Manage Admin Users
+|Create new RA_ADMIN accounts, update existing admin profiles, and disable admin accounts when personnel leave the organisation or change roles.
+
+|2
+|Create RA Officers and Operators
+|Onboard RA_OFFICER and RA_OPERATOR users who perform day-to-day certificate operations.
+
+|3
+|Create Auditor Accounts
+|Onboard AUDITOR users who require read-only access to audit logs and compliance reports.
+
+|4
+|Approve and Reject Certificate Requests
+|Review certificate enrolment requests submitted by end entities, verify supporting documentation, and approve or reject requests based on organisational policy.
+
+|5
+|Revoke Certificates
+|Revoke issued certificates when they are compromised, when the subject's authorisation changes, or when the certificate holder leaves the organisation.
+
+|6
+|View Audit Logs
+|Access the comprehensive audit trail of all system operations, including authentication events, user management actions, and certificate lifecycle events.
+
+|7
+|System Configuration
+|Modify RA system parameters such as token expiry durations, lockout thresholds, password policies, and other operational settings.
+|===
+
+---
+
+[[chapter-7]]
+== 7: Sequence Diagrams
+
+=== 7.1 Phase 1: Root Admin Auto-Creation
+
+[mermaid]
+....
+sequenceDiagram
+    actor DevOps as DevOps / CI-CD
+    participant App as RA Application
+    participant Init as DataInitializer
+    participant DB as PostgreSQL Database
+
+    rect rgb(255, 243, 224)
+    Note over DevOps, DB: Phase 1: Deploy and Auto-Create Root Admin
+
+    DevOps->>App: Deploy RA Application (Docker/K8s/JAR)
+    activate App
+
+    App->>App: Spring Boot starts
+    App->>DB: ORM schema auto-migration
+    activate DB
+    DB-->>App: Tables created (users, user_roles)
+    deactivate DB
+
+    App->>Init: Post-construction lifecycle hook triggered
+    activate Init
+
+    Init->>DB: Query user count
+    activate DB
+    DB-->>Init: count = 0
+
+    alt No users exist (count == 0)
+        Init->>Init: Construct root admin entity
+        Note right of Init: username = "ra-admin"<br/>password = BCrypt(defaultPwd)<br/>role = RA_ADMIN<br/>enabled = true
+
+        Init->>DB: Persist root admin user
+        DB-->>Init: User persisted (id=1)
+        Note right of DB: users table:<br/>id=1, username=ra-admin<br/>password_hash=$2a$10$...<br/>roles=RA_ADMIN
+
+        Init->>Init: Write audit log: ROOT_ADMIN_CREATED
+
+    else Users already exist (count > 0)
+        Init->>Init: Skip creation (idempotent)
+        Note right of Init: No action taken
+    end
+
+    deactivate DB
+    deactivate Init
+
+    App-->>DevOps: Application started successfully
+    deactivate App
+    end
+....
+
+---
+
+=== 7.2 Phase 2: RA Admin Authentication
+
+[mermaid]
+....
+sequenceDiagram
+    actor Admin as RA Admin
+    participant Auth as Auth Controller
+    participant Svc as Authentication Service
+    participant DB as PostgreSQL Database
+    participant JWT as JWT Token Service
+    participant Audit as Audit Logger
+
+    rect rgb(230, 240, 255)
+    Note over Admin, Audit: Phase 2: Admin Authentication
+
+    Admin->>Auth: POST /api/v1/auth/login
+    activate Auth
+
+    Note right of Admin: { "username": "ra-admin",<br/>  "password": "*****" }
+
+    Auth->>Auth: Validate request body (format, presence)
+
+    alt Validation FAILS
+        Auth->>Audit: Log VALIDATION_FAILURE
+        Auth-->>Admin: 400 Bad Request
+        Note right of Auth: { "error": "VALIDATION_FAILURE",<br/>  "details": [...] }
+    end
+
+    Auth->>Auth: Rate limit check (10 req/min/IP)
+    alt Rate limit EXCEEDED
+        Auth-->>Admin: 429 Too Many Requests
+        Note right of Auth: { "error": "RATE_LIMITED",<br/>  "retryAfterSeconds": 60 }
+    end
+
+    Auth->>Svc: authenticate(username, password)
+    activate Svc
+
+    Svc->>Svc: Check account lockout status
+    alt Account LOCKED
+        Svc->>Audit: Log ACCOUNT_LOCKED_ATTEMPT
+        Svc-->>Auth: AccountLockedException
+        Auth-->>Admin: 423 Locked
+        Note right of Auth: { "error": "ACCOUNT_LOCKED",<br/>  "lockedUntil": "..." }
+    end
+
+    Svc->>DB: Lookup user by username
+    activate DB
+    DB-->>Svc: User record or null
+    deactivate DB
+
+    alt User NOT found
+        Svc->>Audit: Log INVALID_CREDENTIALS
+        Svc-->>Auth: AuthenticationException
+        Auth-->>Admin: 401 Unauthorized
+        Note right of Auth: "Invalid username or password."
+    end
+
+    alt Account DISABLED
+        Svc->>Audit: Log ACCOUNT_DISABLED_ATTEMPT
+        Svc-->>Auth: AccountDisabledException
+        Auth-->>Admin: 401 Unauthorized
+        Note right of Auth: "Account is disabled."
+    end
+
+    Svc->>Svc: BCrypt.matches(password, storedHash)
+
+    alt Password does NOT match
+        Svc->>Svc: Increment failed login counter
+        Svc->>Audit: Log INVALID_CREDENTIALS
+        Svc-->>Auth: AuthenticationException
+        Auth-->>Admin: 401 Unauthorized
+        Note right of Auth: "Invalid username or password."
+    end
+
+    Svc->>Svc: Reset failed login counter to 0
+    Svc->>JWT: generateToken(user)
+    activate JWT
+
+    JWT->>JWT: Build JWT claims
+    Note right of JWT: sub = "ra-admin"<br/>roles = ["RA_ADMIN"]<br/>iss = "RA-System"<br/>exp = 24h<br/>Signed: HS256
+
+    JWT-->>Svc: JWT token string
+    deactivate JWT
+
+    Svc->>Audit: Log AUTH_SUCCESS
+    Svc-->>Auth: AuthResponse(token, roles, expiresIn)
+    deactivate Svc
+
+    Auth-->>Admin: 200 OK
+    deactivate Auth
+
+    Note right of Auth: { "token": "eyJhbG...",<br/>  "roles": ["RA_ADMIN"],<br/>  "expiresIn": 86400,<br/>  "tokenType": "Bearer" }
+    end
+....
+
+---
+
+=== 7.3 Phase 3: Admin Creates New User
+
+[mermaid]
+....
+sequenceDiagram
+    actor Admin as Authenticated RA_ADMIN
+    participant Filter as JWT Auth Filter
+    participant Ctrl as Admin Controller
+    participant Svc as Admin User Service
+    participant DB as PostgreSQL Database
+    participant Audit as Audit Logger
+
+    rect rgb(232, 245, 233)
+    Note over Admin, Audit: Phase 3: Create New Admin User
+
+    Admin->>Filter: POST /api/v1/admin/users
+    activate Filter
+
+    Note right of Admin: Authorization: Bearer ey...<br/>{ "username": "new-admin",<br/>  "password": "Secure#Pass1",<br/>  "commonName": "New Admin",<br/>  "email": "newadmin@company.com",<br/>  "roles": ["RA_ADMIN"] }
+
+    Filter->>Filter: Extract Bearer token
+    Filter->>Filter: Validate JWT signature (HS256)
+    Filter->>Filter: Check token expiration
+
+    alt JWT INVALID or EXPIRED
+        Filter->>Audit: Log INVALID_TOKEN
+        Filter-->>Admin: 401 Unauthorized
+        Note right of Filter: "Invalid or expired token."
+    end
+
+    Filter->>Filter: Extract roles from JWT
+    Filter->>Filter: Set SecurityContext
+    deactivate Filter
+
+    Filter->>Ctrl: Forward authenticated request
+    activate Ctrl
+
+    Ctrl->>Ctrl: Check role authorisation (RA_ADMIN required)
+
+    alt Role check FAILS
+        Ctrl->>Audit: Log ACCESS_DENIED
+        Ctrl-->>Admin: 403 Forbidden
+        Note right of Ctrl: "Access denied. RA_ADMIN role required."
+    end
+
+    Ctrl->>Svc: createUser(request)
+    activate Svc
+
+    Svc->>Svc: Validate all input fields
+
+    alt Validation FAILS
+        Svc->>Audit: Log VALIDATION_FAILURE
+        Svc-->>Ctrl: ValidationException
+        Ctrl-->>Admin: 400 Bad Request
+        Note right of Ctrl: { "error": "VALIDATION_FAILURE",<br/>  "details": [...] }
+    end
+
+    Svc->>DB: Check if username exists
+    activate DB
+    DB-->>Svc: null (no existing user)
+    deactivate DB
+
+    alt Username ALREADY EXISTS
+        Svc->>Audit: Log DUPLICATE_USERNAME
+        Svc-->>Ctrl: DuplicateException
+        Ctrl-->>Admin: 409 Conflict
+        Note right of Ctrl: "Username already exists."
+    end
+
+    Svc->>Svc: Hash password with BCrypt
+
+    Svc->>DB: Persist new user with roles
+    activate DB
+    DB-->>Svc: User persisted (id=2)
+    deactivate DB
+
+    Svc->>Audit: Log USER_CREATED (by ra-admin)
+    Svc-->>Ctrl: Created user details
+    deactivate Svc
+
+    Ctrl-->>Admin: 201 Created
+    deactivate Ctrl
+
+    Note right of Ctrl: { "username": "new-admin",<br/>  "roles": ["RA_ADMIN"],<br/>  "createdBy": "ra-admin" }
+    end
+....
+
+---
+
+=== 7.4 Phase 4: New Admin Logs In & Manages System
+
+[mermaid]
+....
+sequenceDiagram
+    actor NewAdmin as New Admin (new-admin)
+    participant Auth as Auth Controller
+    participant JWT as JWT Token Service
+    participant System as RA Management System
+
+    rect rgb(243, 229, 245)
+    Note over NewAdmin, System: Phase 4: New Admin Authentication & Management
+
+    NewAdmin->>Auth: POST /api/v1/auth/login
+    activate Auth
+
+    Note right of NewAdmin: { "username": "new-admin",<br/>  "password": "Secure#Pass1" }
+
+    Auth->>Auth: Same authentication flow as Phase 2
+    Auth->>JWT: generateToken(user)
+    activate JWT
+    JWT-->>Auth: JWT with roles [RA_ADMIN]
+    deactivate JWT
+
+    Auth-->>NewAdmin: 200 OK with JWT token
+    deactivate Auth
+
+    Note right of Auth: { "token": "eyJhbG...",<br/>  "roles": ["RA_ADMIN"],<br/>  "expiresIn": 86400 }
+
+    NewAdmin->>System: Access RA Management endpoints (with Bearer JWT)
+    activate System
+
+    Note right of System: RA_ADMIN Capabilities:<br/>- Create / Manage Admin users<br/>- Create RA Officers & Operators<br/>- Approve / Reject certificates<br/>- Revoke certificates<br/>- View audit logs<br/>- System configuration
+
+    System-->>NewAdmin: Management access granted
+    deactivate System
+    end
+....
+
+---
+
+[[chapter-8]]
+== 8: State Diagram -- Enrolment Lifecycle
+
+[mermaid]
+....
+stateDiagram-v2
+    [*] --> SystemDeployment : DevOps deploys RA Application
+
+    state SystemDeployment {
+        [*] --> AppStarting
+        AppStarting --> SchemaReady : ORM creates tables
+    }
+
+    SchemaReady --> DataInitialization
+
+    state DataInitialization {
+        [*] --> CheckUserCount
+        CheckUserCount --> NoUsersExist : count == 0
+        CheckUserCount --> UsersExist : count > 0
+        NoUsersExist --> HashDefaultPassword : BCrypt encode
+        HashDefaultPassword --> PersistRootAdmin : Save to database
+        PersistRootAdmin --> RootAdminCreated
+    }
+
+    UsersExist --> SystemReady : Skip creation
+    RootAdminCreated --> SystemReady
+
+    SystemReady --> RootAdminLogin : POST /api/v1/auth/login
+
+    state RootAdminLogin {
+        [*] --> ValidateInput
+        ValidateInput --> InputInvalid : Validation fails
+        ValidateInput --> RateLimitCheck : Input valid
+
+        InputInvalid --> SystemReady : 400 Bad Request
+
+        RateLimitCheck --> RateLimited : Exceeded
+        RateLimitCheck --> LockoutCheck : Under limit
+
+        RateLimited --> SystemReady : 429 Too Many Requests
+
+        LockoutCheck --> AccountLocked : Account locked
+        LockoutCheck --> LookupUser : Not locked
+
+        AccountLocked --> SystemReady : 423 Locked
+
+        LookupUser --> UserNotFound : Not in DB
+        LookupUser --> CheckEnabled : User found
+
+        UserNotFound --> LoginFailed
+
+        CheckEnabled --> AccountDisabled : enabled = false
+        CheckEnabled --> VerifyPassword : enabled = true
+
+        AccountDisabled --> LoginFailed
+
+        VerifyPassword --> PasswordMismatch : BCrypt mismatch
+        VerifyPassword --> PasswordMatch : BCrypt match
+
+        PasswordMismatch --> LoginFailed
+    }
+
+    state LoginFailed {
+        [*] --> IncrementFailCounter
+        IncrementFailCounter --> AuditLogFailure : Log attempt
+    }
+
+    AuditLogFailure --> SystemReady : 401 Unauthorized
+
+    PasswordMatch --> GenerateJWT
+
+    state GenerateJWT {
+        [*] --> BuildClaims
+        BuildClaims --> SignToken : sub, roles, iss, exp
+        SignToken --> TokenReady : HS256 signed
+    }
+
+    TokenReady --> Authenticated : 200 OK with JWT
+
+    Authenticated --> CreateNewAdmin : POST /api/v1/admin/users
+
+    state CreateNewAdmin {
+        [*] --> JWTValidation
+        JWTValidation --> TokenInvalid : Invalid JWT
+        JWTValidation --> CheckRole : JWT valid
+
+        TokenInvalid --> Authenticated : 401 Unauthorized
+
+        CheckRole --> AccessDenied : Not RA_ADMIN
+        CheckRole --> ValidateUserInput : RA_ADMIN confirmed
+
+        AccessDenied --> Authenticated : 403 Forbidden
+
+        ValidateUserInput --> InvalidInput : Validation fails
+        ValidateUserInput --> CheckDuplicate : Input valid
+
+        InvalidInput --> Authenticated : 400 Bad Request
+
+        CheckDuplicate --> DuplicateFound : Username exists
+        CheckDuplicate --> HashPassword : Available
+
+        DuplicateFound --> Authenticated : 409 Conflict
+
+        HashPassword --> SaveUser : BCrypt encode
+        SaveUser --> NewUserCreated : Persisted
+    }
+
+    NewUserCreated --> NewAdminExists : 201 Created
+
+    NewAdminExists --> NewAdminLogin : POST /api/v1/auth/login
+
+    state NewAdminLogin {
+        [*] --> SameAsRootLogin
+        SameAsRootLogin --> NewAdminJWT : Authentication success
+    }
+
+    NewAdminJWT --> NewAdminAuthenticated : 200 OK with JWT
+
+    state NewAdminAuthenticated {
+        [*] --> ManageSystem
+        ManageSystem --> CreateUsers : Create/Manage users
+        ManageSystem --> ManageCerts : Approve/Reject/Revoke certs
+        ManageSystem --> ViewLogs : View audit logs
+        ManageSystem --> Configure : System configuration
+    }
+
+    NewAdminAuthenticated --> [*] : Token expires
+....
+
+---
+
+[[chapter-9]]
+== 9: Block Diagram -- System Architecture
+
+[mermaid]
+....
+flowchart TB
+    subgraph CLIENT["Client / API Consumer"]
+        direction TB
+        LOGIN["Login Request<br/>POST /api/v1/auth/login"]
+        CREATE["Create User Request<br/>POST /api/v1/admin/users"]
+        RESP["Response Handler<br/>JWT Token / User Data"]
+    end
+
+    subgraph APP["RA Application (Spring Boot)"]
+        direction TB
+        AC["Auth Controller<br/>/api/v1/auth/login"]
+        ADC["Admin Controller<br/>/api/v1/admin/users"]
+        AS["Authentication Service<br/>Credential Validation"]
+        AUS["Admin User Service<br/>User CRUD Operations"]
+        JWTS["JWT Token Service<br/>Generate / Validate Tokens"]
+        DI["DataInitializer<br/>Root Admin Bootstrap"]
+    end
+
+    subgraph SECURITY["Security Layer"]
+        direction TB
+        JWTF["JWT Authentication Filter<br/>Extract & Validate Bearer Token"]
+        RBAC["Role-Based Access Control<br/>RA_ADMIN Enforcement"]
+        BC["Password Encoder<br/>BCrypt Hash & Verify"]
+        RL["Rate Limiter<br/>10 req/min/IP"]
+        LM["Lockout Manager<br/>5 attempts / 30 min lock"]
+    end
+
+    subgraph DATA["Data Layer"]
+        direction TB
+        UT["Users Store<br/>(username, password_hash, enabled)"]
+        RT["Roles Store<br/>(user_id, role)"]
+        AL["Audit Log Store<br/>(event, actor, timestamp, IP)"]
+    end
+
+    LOGIN --> RL
+    RL --> AC
+    CREATE --> JWTF
+    JWTF --> RBAC
+    RBAC --> ADC
+    AC --> LM
+    LM --> AS
+    AS --> BC
+    ADC --> AUS
+    AUS --> BC
+    AS --> JWTS
+    AS --> UT
+    AUS --> UT
+    AUS --> RT
+    DI --> UT
+    JWTS --> RESP
+    AUS --> RESP
+    AS --> AL
+    AUS --> AL
+
+    style CLIENT fill:#E3F2FD,stroke:#1565C0
+    style APP fill:#FFF3E0,stroke:#E65100
+    style SECURITY fill:#E8F5E9,stroke:#2E7D32
+    style DATA fill:#FCE4EC,stroke:#C62828
+....
+
+---
+
+[[chapter-10]]
+== 10: REST API Reference -- Endpoint Summary
+
+[cols="1,3,5,2", options="header"]
+|===
+|Method |Endpoint |Description |Auth Required
+
+|POST
+|`/api/v1/auth/login`
+|Authenticate RA admin user with username and password. Returns a JWT token on success.
+|No (public endpoint)
+
+|POST
+|`/api/v1/admin/users`
+|Create a new RA management user with specified roles. Requires RA_ADMIN role.
+|Yes (Bearer JWT with RA_ADMIN)
+|===
+
+For detailed request/response structures, refer to:
+
+* <<chapter-4, Chapter 4: FR-RAE-002>> for the Authentication endpoint (POST /api/v1/auth/login).
+* <<chapter-5, Chapter 5: FR-RAE-003>> for the Admin User Creation endpoint (POST /api/v1/admin/users).
+
+---
+
+[[chapter-11]]
+== 11: Comprehensive Validation Rules
+
+=== 11.1 Client-Side Validation -- Login Form
+
+[cols="2,4,3", options="header"]
+|===
+|Field |Validation Rule |Error Message
+
+|Username
+|Required. Must not be empty or null.
+|"Username is required."
+
+|Username
+|Minimum 3 characters. Maximum 50 characters.
+|"Username must be between 3 and 50 characters."
+
+|Username
+|Alphanumeric characters, dots, and underscores only.
+|"Username contains invalid characters."
+
+|Username
+|No leading or trailing whitespace.
+|"Username must not contain leading or trailing spaces."
+
+|Password
+|Required. Must not be empty or null.
+|"Password is required."
+
+|Password
+|Minimum 8 characters. Maximum 128 characters.
+|"Password must be between 8 and 128 characters."
+
+|Password
+|Must not consist entirely of whitespace.
+|"Password cannot be blank."
+|===
+
+=== 11.2 Client-Side Validation -- Create User Form
+
+[cols="2,4,3", options="header"]
+|===
+|Field |Validation Rule |Error Message
+
+|Username
+|Required. 3-50 characters. Alphanumeric with dots and underscores.
+|"Username is required and must be 3-50 alphanumeric characters."
+
+|Password
+|Required. 8-128 characters. At least one uppercase, one lowercase, one digit, one special character.
+|"Password must meet complexity requirements."
+
+|Common Name
+|Required. 2-100 characters.
+|"Display name is required and must be 2-100 characters."
+
+|Email
+|Required. Valid email format.
+|"A valid email address is required."
+
+|Roles
+|Required. At least one role selected from the valid set.
+|"At least one role must be selected."
+|===
+
+=== 11.3 Server-Side Validation -- Authentication
+
+[cols="3,4,3", options="header"]
+|===
+|Validation |Rule |Error Response
+
+|Input Presence
+|`username` and `password` must be present and non-empty.
+|HTTP 400 -- "Username and password are required."
+
+|Input Format
+|`username` must match `^[a-zA-Z0-9._]{3,50}$`.
+|HTTP 400 -- "Username format is invalid."
+
+|Input Sanitisation
+|All inputs sanitised against injection attacks.
+|HTTP 400 -- "Invalid characters in input."
+
+|Rate Limiting
+|Max 10 login requests per minute per source IP.
+|HTTP 429 -- "Too many login attempts."
+
+|Account Lockout
+|Reject if 5+ consecutive failures within lockout window.
+|HTTP 423 -- "Account temporarily locked."
+
+|User Existence
+|Username must exist in user store.
+|HTTP 401 -- "Invalid username or password."
+
+|Account Enabled
+|User `enabled` flag must be `true`.
+|HTTP 401 -- "Account is disabled."
+
+|Password Match
+|BCrypt hash comparison must succeed.
+|HTTP 401 -- "Invalid username or password."
+|===
+
+=== 11.4 Server-Side Validation -- JWT Authentication
+
+[cols="3,4,3", options="header"]
+|===
+|Validation |Rule |Error Response
+
+|Token Presence
+|`Authorization` header must contain `Bearer <token>`.
+|HTTP 401 -- "Missing or invalid authorization header."
+
+|Token Format
+|Token must be a well-formed JWT with header, payload, and signature.
+|HTTP 401 -- "Malformed token."
+
+|Signature Verification
+|Token signature must be verifiable with the server's HS256 secret.
+|HTTP 401 -- "Invalid token signature."
+
+|Token Expiration
+|`exp` claim must be in the future.
+|HTTP 401 -- "Token has expired."
+
+|Required Claims
+|Token must contain `sub` and `roles` claims.
+|HTTP 401 -- "Token is missing required claims."
+|===
+
+=== 11.5 Server-Side Validation -- User Creation
+
+[cols="3,4,3", options="header"]
+|===
+|Validation |Rule |Error Response
+
+|Role Authorisation
+|JWT `roles` claim must include `RA_ADMIN`.
+|HTTP 403 -- "Access denied. RA_ADMIN role required."
+
+|Username Format
+|`username` must match `^[a-zA-Z0-9._]{3,50}$`.
+|HTTP 400 -- "Username format is invalid."
+
+|Password Complexity
+|8-128 chars, uppercase, lowercase, digit, special char.
+|HTTP 400 -- Specific error per failed rule.
+
+|Email Format
+|Valid RFC 5322 email.
+|HTTP 400 -- "Email format is invalid."
+
+|Common Name Length
+|2-100 characters.
+|HTTP 400 -- "Display name must be 2-100 characters."
+
+|Role Validity
+|Each role must be in {RA_ADMIN, RA_OFFICER, RA_OPERATOR, AUDITOR}.
+|HTTP 400 -- "Invalid role specified."
+
+|Roles Non-Empty
+|`roles` array must have at least one element.
+|HTTP 400 -- "At least one role is required."
+
+|Duplicate Username
+|Username must not already exist.
+|HTTP 409 -- "Username already exists."
+
+|Input Sanitisation
+|All string fields sanitised for injection.
+|HTTP 400 -- "Invalid characters in input."
+|===
+
+=== 11.6 Database-Level Validation
+
+[cols="3,4,3", options="header"]
+|===
+|Constraint |Rule |Behaviour on Violation
+
+|Username UNIQUE
+|No two users may share the same username.
+|Database rejects the INSERT; application returns HTTP 409.
+
+|Username NOT NULL
+|Every user must have a username.
+|Database rejects the INSERT; application returns HTTP 500.
+
+|Password Hash NOT NULL
+|Every user must have a password hash.
+|Database rejects the INSERT; application returns HTTP 500.
+
+|Enabled NOT NULL DEFAULT TRUE
+|Account status must always have a boolean value.
+|Database applies default value of `true` if not specified.
+
+|Role Foreign Key
+|Role assignments must reference a valid user.
+|Database rejects the INSERT; application returns HTTP 500.
+
+|Role Composite Primary Key
+|Same role cannot be assigned twice to the same user.
+|Database rejects the duplicate INSERT; application handles gracefully.
+|===
+
+---
+
+[[chapter-12]]
+== 12: Error Code Reference
+
+[cols="2,1,4,3", options="header"]
+|===
+|Error Code |HTTP Status |Description |User-Facing Message
+
+|`VALIDATION_FAILURE`
+|400
+|One or more request body fields failed validation (missing, wrong format, out of range).
+|"Request validation failed." (with array of specific field errors)
+
+|`INVALID_CREDENTIALS`
+|401
+|Username does not exist or password does not match. The system intentionally does not distinguish between these two cases.
+|"Invalid username or password."
+
+|`ACCOUNT_DISABLED`
+|401
+|User account exists but the `enabled` flag is set to `false`. The user cannot authenticate until re-enabled by an admin.
+|"Account is disabled. Contact your administrator."
+
+|`UNAUTHORIZED`
+|401
+|The JWT token is missing, malformed, has an invalid signature, or has expired.
+|"Invalid or expired token."
+
+|`FORBIDDEN`
+|403
+|The authenticated user does not have the required role for the requested operation.
+|"Access denied. Insufficient privileges."
+
+|`DUPLICATE_USERNAME`
+|409
+|A user with the specified username already exists in the system.
+|"A user with this username already exists."
+
+|`ACCOUNT_LOCKED`
+|423
+|The account has been locked due to 5 consecutive failed login attempts. The lockout expires after 30 minutes.
+|"Account temporarily locked. Try again after 30 minutes."
+
+|`RATE_LIMITED`
+|429
+|The source IP address has exceeded the login rate limit (10 requests per minute).
+|"Too many login attempts. Please try again later."
+
+|`INTERNAL_SERVER_ERROR`
+|500
+|An unexpected error occurred during processing (database failure, JWT signing error, unhandled exception).
+|"An unexpected error occurred. Please contact your system administrator."
+|===
+
+---
+
+[[chapter-13]]
+== 13: Security Considerations
+
+=== 13.1 Password Security
+
+* All passwords must be hashed using *BCrypt* with a minimum cost factor of *10*. The cost factor
+  should be configurable to allow future increases as hardware performance improves.
+* Plaintext passwords must *never* be stored in the database, logged in application or audit logs,
+  returned in API responses, or transmitted in URLs or query parameters.
+* Password complexity requirements (uppercase, lowercase, digit, special character, 8-128 characters)
+  must be enforced at both the client side (for immediate user feedback) and the server side (as the
+  authoritative validation).
+* The system should implement password strength estimation to reject commonly used passwords from
+  known breach databases (e.g., Have I Been Pwned integration) in future iterations.
+
+=== 13.2 JWT Security
+
+* Tokens must be signed with *HS256* (HMAC-SHA256) using a server-side secret key of at least 256 bits.
+* The JWT secret key must be stored securely: in an environment variable, a secrets manager (e.g.,
+  HashiCorp Vault, AWS Secrets Manager), or a Kubernetes secret. It must *never* be hardcoded in
+  source code or committed to version control.
+* Token expiration (`exp` claim) must be set to a finite duration (default: 24 hours). The system must
+  reject expired tokens without exception.
+* The `iss` (issuer) claim must be validated on token verification to ensure the token was issued by
+  this system.
+* Tokens should be transmitted only over HTTPS. The system should set the `Strict-Transport-Security`
+  header to enforce HTTPS connections.
+
+=== 13.3 Role-Based Access Control (RBAC)
+
+* All protected endpoints must enforce role-based access control through the JWT Authentication Filter
+  and method-level security annotations.
+* The JWT Authentication Filter must execute on every request to protected endpoints, extracting and
+  validating the Bearer token before the request reaches the controller.
+* Role checks must be performed after JWT validation. A valid token with insufficient roles must result
+  in HTTP 403 Forbidden, not HTTP 401 Unauthorized.
+* Access denied responses must not reveal which specific role is required, to prevent information leakage
+  about the system's access control configuration.
+
+=== 13.4 Root Admin Protection
+
+* The root admin account (`ra-admin`) is auto-created only when the user store is empty. This process is
+  idempotent and will not create duplicates on subsequent application restarts.
+* The root admin account should not be deletable through the API. The service layer must reject deletion
+  requests for the root admin user.
+* The root admin's default password must be changed after the first login. The system should prompt the
+  admin to change the password, though enforcement is deferred to a future iteration.
+
+=== 13.5 Input Sanitisation
+
+* All user inputs must be validated and sanitised before processing.
+* The ORM layer must use parameterised queries to prevent SQL injection. Raw SQL queries must not be
+  used anywhere in the application.
+* String inputs must be validated for maximum length, allowed character sets, and absence of control
+  characters to prevent XSS and other injection attacks.
+* Error messages must not expose internal system details such as stack traces, database table names,
+  or query structures.
+
+=== 13.6 Audit Logging
+
+* All authentication attempts (success, failure, lockout) must be logged with: event type, timestamp,
+  username, source IP address, user agent, and result.
+* All user management operations (create, update, disable) must be logged with: event type, timestamp,
+  acting admin's username, target user's username, and the action performed.
+* Audit logs must be stored in a tamper-resistant store. The application must not provide API endpoints
+  to modify or delete audit log entries.
+* Audit log entries must include a correlation ID to enable tracing of related events across distributed
+  system components.
+
+=== 13.7 Transport Security
+
+* All API communication must occur over *HTTPS (TLS 1.2 or higher)*.
+* HTTP requests must be redirected to HTTPS or rejected.
+* The application should set security headers: `Strict-Transport-Security`, `X-Content-Type-Options: nosniff`,
+  `X-Frame-Options: DENY`, and `Content-Security-Policy`.
+
+---
+
+[[chapter-14]]
+== 14: Non-Functional Requirements
+
+[cols="2,6", options="header"]
+|===
+|Requirement |Description
+
+|Performance -- Authentication
+|The `POST /api/v1/auth/login` endpoint must respond within *500 milliseconds* under normal load (excluding network latency). BCrypt hashing is computationally expensive by design; the cost factor must be balanced between security and response time.
+
+|Performance -- User Creation
+|The `POST /api/v1/admin/users` endpoint must respond within *1 second* under normal load.
+
+|Availability
+|The RA Admin authentication and user management services must achieve *99.9% uptime* during business hours. Since the authentication service is independent of Active Directory, its availability is not impacted by AD outages.
+
+|Scalability
+|The stateless JWT-based authentication model enables *horizontal scaling* of the RA Application. Multiple instances can validate JWT tokens independently without shared session state.
+
+|Audit Trail Retention
+|Audit log records must be retained for a minimum of *7 years* to comply with regulatory requirements for certificate authority operations.
+
+|Data Protection
+|Passwords must be stored only as BCrypt hashes. JWT secret keys must be stored in a secrets manager. Database connections must use TLS encryption.
+
+|Backup and Recovery
+|The PostgreSQL user store must be backed up daily with point-in-time recovery capability. The backup must include both the `users` and `user_roles` tables.
+
+|Monitoring
+|The application must expose health check endpoints and metrics for authentication success/failure rates, active user counts, and lockout events.
+|===
+
+---
+
+[[chapter-15]]
+== 15: Assumptions & Dependencies
+
+=== 15.1 Assumptions
+
+. *RA Admin users do NOT authenticate via Active Directory.* The authentication model is entirely self-contained, using PostgreSQL as the user store and BCrypt for password verification.
+. *PostgreSQL is the chosen relational database.* The schema design, constraints, and query patterns described in this document assume PostgreSQL. Migration to another RDBMS may require adjustments.
+. *The JWT signing secret is externalized.* The HS256 secret key is provided through an environment variable or secrets manager, not hardcoded in configuration files.
+. *The BCrypt cost factor is configurable.* The default cost factor is 10, but it can be increased in future deployments as hardware performance improves.
+. *HTTPS is enforced at the infrastructure level.* The application assumes that TLS termination is handled by a reverse proxy, load balancer, or ingress controller.
+. *The root admin default password is provided at deployment time.* The password is passed through an environment variable and is never hardcoded.
+. *Rate limiting is enforced at the application or API gateway level.* The rate limiting thresholds described in this document may be adjusted based on operational experience.
+
+=== 15.2 Dependencies
+
+[cols="2,5", options="header"]
+|===
+|Dependency |Description
+
+|PostgreSQL Database
+|Required for user account and role storage. Must be running and accessible before the application starts.
+
+|JWT Signing Secret
+|Must be configured as an environment variable or retrieved from a secrets manager at startup.
+
+|ORM Framework
+|The application depends on an ORM with schema auto-migration capability to create and update database tables on startup.
+
+|BCrypt Library
+|A BCrypt implementation compatible with Spring Security's PasswordEncoder interface.
+
+|Reverse Proxy / Load Balancer
+|Expected to handle TLS termination, forward `X-Forwarded-For` headers for IP-based rate limiting, and route traffic to application instances.
+|===
+
+=== 15.3 Constraints
+
+. The system must not depend on Active Directory for RA admin authentication under any circumstances.
+. The root admin auto-creation must be idempotent and safe for repeated application restarts.
+. JWT tokens must be the sole mechanism for maintaining authenticated state; no server-side sessions are permitted.
+. All passwords must be hashed with BCrypt; no other hashing algorithm is acceptable for password storage.
+. Audit logs must be append-only; no mechanism for modifying or deleting audit records may be exposed through the API.

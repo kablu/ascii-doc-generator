@@ -144,6 +144,94 @@ tasks.register('endEntityPdf', org.asciidoctor.gradle.jvm.pdf.AsciidoctorPdfTask
     )
 }
 
+// End Entity Login Requirement - standalone AsciiDoc (no test snippets needed)
+tasks.register('endEntityLoginHtml', org.asciidoctor.gradle.jvm.AsciidoctorTask) {
+    sourceDir = file('docs/end-entity/requirement/end-entity-login')
+    sources {
+        include 'index.adoc'
+    }
+    outputDir = file("build/docs/end-entity-login/html")
+    configurations 'asciidoctorExt'
+
+    baseDirFollowsSourceDir()
+
+    attributes(
+        'project-version': project.version,
+        'source-highlighter': 'coderay',
+        'toc': 'left',
+        'toclevels': '4',
+        'icons': 'font',
+        'idprefix': '',
+        'idseparator': '-'
+    )
+}
+
+tasks.register('endEntityLoginPdf', org.asciidoctor.gradle.jvm.pdf.AsciidoctorPdfTask) {
+    sourceDir = file('docs/end-entity/requirement/end-entity-login')
+    sources {
+        include 'index.adoc'
+    }
+    outputDir = file("build/docs/end-entity-login/pdf")
+    configurations 'asciidoctorExt'
+
+    baseDirFollowsSourceDir()
+
+    attributes(
+        'project-version': project.version,
+        'source-highlighter': 'coderay',
+        'toc': 'left',
+        'toclevels': '4',
+        'icons': 'font',
+        'idprefix': '',
+        'idseparator': '-',
+        'pdf-theme': 'default-with-fallback-font'
+    )
+}
+
+// RA Admin Enrollment Requirement - standalone AsciiDoc (no test snippets needed)
+tasks.register('raAdminEnrollmentHtml', org.asciidoctor.gradle.jvm.AsciidoctorTask) {
+    sourceDir = file('docs/end-entity/requirement/ra-admin-enrollment')
+    sources {
+        include 'index.adoc'
+    }
+    outputDir = file("build/docs/ra-admin-enrollment/html")
+    configurations 'asciidoctorExt'
+
+    baseDirFollowsSourceDir()
+
+    attributes(
+        'project-version': project.version,
+        'source-highlighter': 'coderay',
+        'toc': 'left',
+        'toclevels': '4',
+        'icons': 'font',
+        'idprefix': '',
+        'idseparator': '-'
+    )
+}
+
+tasks.register('raAdminEnrollmentPdf', org.asciidoctor.gradle.jvm.pdf.AsciidoctorPdfTask) {
+    sourceDir = file('docs/end-entity/requirement/ra-admin-enrollment')
+    sources {
+        include 'index.adoc'
+    }
+    outputDir = file("build/docs/ra-admin-enrollment/pdf")
+    configurations 'asciidoctorExt'
+
+    baseDirFollowsSourceDir()
+
+    attributes(
+        'project-version': project.version,
+        'source-highlighter': 'coderay',
+        'toc': 'left',
+        'toclevels': '4',
+        'icons': 'font',
+        'idprefix': '',
+        'idseparator': '-',
+        'pdf-theme': 'default-with-fallback-font'
+    )
+}
+
 bootJar {
     dependsOn asciidoctor, asciidoctorPdf
     from("${asciidoctor.outputDir}") {
